@@ -19,17 +19,18 @@ pub struct Price {
 /// 内置价格表快照日期
 pub const PRICE_SNAPSHOT_DATE: &str = "2026-09-06";
 
-/// 内置价格表：按「高峰时段」的保守口径（空闲时段减半，见 price_note）。
-/// 快照来源：DeepSeek 官方定价页（2026-09-06 核准，api-docs.deepseek.com/zh-cn/quick_start/pricing）。
+/// 内置价格表：DeepSeek 官方定价页「高峰时段」口径（2026-09-06 核准；
+/// 空闲时段全场半价，chat() 按北京时间自动判断，见 beijing_peak）。
 /// 缓存命中价约为未命中的 1/30——DeepSeek 的 system prompt 前缀缓存命中率很高，
 /// 按全价计会显著虚高（真机反馈的"计费有误"主因）。
-/// deepseek-chat 现行价格与 V4-Flash 同档；表外模型经 config [llm.*] 或设置页覆盖。
-/// 本地端点（localhost/127.0.0.1）默认免费。
+/// v4-flash-vision-exp 与 v4-flash 同价（官方页明列）；表外模型经 config [llm.*]
+/// 或设置页覆盖。本地端点（localhost/127.0.0.1）默认免费。
 fn builtin_price(model: &str) -> Option<Price> {
     let m = model.trim().to_ascii_lowercase();
     // (关键字, 输入未命中, 输入命中, 输出) 元 / 百万 tokens，高峰时段
     const TABLE: &[(&str, f64, f64, f64)] = &[
         ("deepseek-chat", 3.0, 0.10, 9.0),
+        ("deepseek-v4-flash-vision-exp", 3.0, 0.10, 9.0),
         ("deepseek-v4-flash", 3.0, 0.10, 9.0),
         ("deepseek-reasoner", 9.0, 0.30, 27.0),
         ("deepseek-v4-pro", 9.0, 0.30, 27.0),
@@ -42,6 +43,18 @@ fn builtin_price(model: &str) -> Option<Price> {
             cache_input_per_m: Some(*c),
             output_per_m: *o,
         })
+}
+
+/// DeepSeek 高峰时段判断（北京时间 = UTC+8 固定偏移，无夏令时）：
+/// 周一至周五 9:00–12:00 与 14:00–18:00 为高峰，其余（含周末、午休）空闲半价。
+/// 只对内置表（DeepSeek 系）生效；手动配置的价格按用户填写值原样计。
+fn beijing_peak(unix_secs: u64) -> bool {
+    let bj = unix_secs + 8 * 3600; // 北京时间当日内秒数
+    let day = bj / 86400;
+    let hour = (bj % 86400) / 3600;
+    // 1970-01-01 是周四；折算成周一=0 的星期序号
+    let weekday_mon0 = (day + 3) % 7;
+    weekday_mon0 < 5 && ((9..12).contains(&hour) || (14..18).contains(&hour))
 }
 
 fn local_free(base_url: &str) -> Option<Price> {
@@ -98,6 +111,7 @@ pub enum LlmError {
     EmptyContent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriceSource {
     Builtin,
     Config,
@@ -112,16 +126,124 @@ pub fn resolve_price(p: &crate::config::LlmProfile) -> (Option<Price>, PriceSour
             Some(Price { input_per_m: i, cache_input_per_m: p.price_cache_per_m, output_per_m: o }),
             PriceSource::Config,
         ),
-        _ => {
-            if let Some(pr) = builtin_price(&p.model) {
-                (Some(pr), PriceSource::Builtin)
-            } else if let Some(pr) = local_free(&p.base_url) {
-                (Some(pr), PriceSource::LocalFree)
-            } else {
-                (None, PriceSource::Unknown)
-            }
-        }
+        _ => match builtin_or_local(&p.base_url, &p.model) {
+            Some((pr, src)) => (Some(pr), src),
+            None => (None, PriceSource::Unknown),
+        },
     }
+}
+
+/// 内置表 > 本地端点免费（带来源；resolve_price 与界面预填共用同一优先级）
+fn builtin_or_local(base_url: &str, model: &str) -> Option<(Price, PriceSource)> {
+    builtin_price(model)
+        .map(|p| (p, PriceSource::Builtin))
+        .or_else(|| local_free(base_url).map(|p| (p, PriceSource::LocalFree)))
+}
+
+/// 界面预填用：给定 base_url/model 解析「将生效」的内置价格（不含 meta 覆盖——
+/// 覆盖是否适用由 server 侧按模型绑定判断后优先返回）
+pub fn peek_builtin_price(base_url: &str, model: &str) -> Option<Price> {
+    builtin_or_local(base_url, model).map(|(p, _)| p)
+}
+
+/// 拉取服务端可用模型列表（OpenAI 兼容 GET /models；设置页/引导页「获取模型」按钮用）。
+/// 短超时独立请求，不复用 chat 的 180s client；错误原样透传服务商 message
+/// （如 base_url 缺 /v1 时多数端点 404，前端据此提示）。
+pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, LlmError> {
+    let url = format!("{}/models", base_url.trim().trim_end_matches('/'));
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent(concat!("tonight/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| LlmError::Network(e.to_string()))?;
+    let resp = http
+        .get(&url)
+        .bearer_auth(api_key.trim())
+        .send()
+        .await
+        .map_err(|e| LlmError::Network(e.to_string()))?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.map_err(|e| LlmError::Network(e.to_string()))?;
+    if !(200..300).contains(&status) {
+        let msg = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or_else(|| crate::steam_client::truncate(&text, 200));
+        return Err(LlmError::Http { status, msg });
+    }
+    Ok(parse_models_response(&text))
+}
+
+/// 解析 OpenAI 兼容 /models 响应 {"data":[{"id":..},..]}；排序去空，缺 data/非 JSON 返回空表
+fn parse_models_response(text: &str) -> Vec<String> {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|v| v["data"].as_array().cloned())
+        .map(|arr| {
+            let mut ids: Vec<String> = arr
+                .iter()
+                .filter_map(|m| m["id"].as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            ids.sort();
+            ids.dedup();
+            ids
+        })
+        .unwrap_or_default()
+}
+
+/// 服务商/模型参数约束（快照 2026-09-06，依各家官方文档与社区实测核准）：
+/// - Moonshot/Kimi（api.moonshot.cn/.ai）：K2.5+/K3 等新模型显式传 temperature/top_p 会
+///   被 400 拒绝（官方文档建议不传）——一律省略，用服务端默认（对旧模型也无害）。
+/// - OpenAI 推理系（o1/o3/o4/gpt-5 前缀，不限 host）：temperature 返回 400
+///   unsupported_parameter，且 max_tokens 需改用 max_completion_tokens（Azure OpenAI 文档）。
+/// - 思考模式全局关闭：本应用所有 LLM 任务（意图解析/卡片/定位）都是结构化短输出，
+///   不需要思考。一律发送 thinking:{type:disabled}——DeepSeek V4 等默认思考模型的
+///   reasoning_content 计入 max_tokens，会把小预算调用的回答挤成空响应（真机实测：
+///   意图解析 512 预算 100% 被思考吃光，content 恒空）；顺带省掉思考 token 费用。
+///   服务商不识别该字段而 400 时按错误文本剥离重试；忽略该字段的表外思考模型由
+///   chat() 的"空响应加倍预算重试"兜底。
+/// - DeepSeek/GLM/MiniMax/Qwen/豆包等其余取值范围覆盖本项目用量（0.1–0.7），无需干预。
+/// 其余表外模型由 chat() 的 400 降级重试兜底：错误点名哪个参数就剥离哪个。
+#[derive(Debug, Clone, Copy)]
+pub struct ParamRule {
+    /// 省略 temperature 字段（用服务端默认）
+    pub omit_temperature: bool,
+    /// max_tokens 语义的实际字段名
+    pub max_tokens_field: &'static str,
+    /// 界面提示（设置页/引导页展示；None = 无需提示）
+    pub notice: Option<&'static str>,
+}
+
+const PARAM_DEFAULT: ParamRule =
+    ParamRule { omit_temperature: false, max_tokens_field: "max_tokens", notice: None };
+
+pub fn builtin_param_rule(base_url: &str, model: &str) -> ParamRule {
+    let host = base_url.to_ascii_lowercase();
+    if host.contains("moonshot") || host.contains("kimi") {
+        return ParamRule {
+            omit_temperature: true,
+            max_tokens_field: "max_tokens",
+            notice: Some(
+                "检测到 Kimi（Moonshot）：其新模型不允许显式传 temperature 等采样参数，已自动适配（省略该参数，用服务端默认）。如遇异常推荐使用 DeepSeek。",
+            ),
+        };
+    }
+    let m = model.trim().to_ascii_lowercase();
+    let is_openai_reasoning = ["o1", "o3", "o4", "gpt-5"].iter().any(|k| {
+        m == *k || m.starts_with(&format!("{k}-")) || m.starts_with(&format!("{k}.")) || m.starts_with(&format!("{k}_"))
+    });
+    if is_openai_reasoning {
+        return ParamRule {
+            omit_temperature: true,
+            max_tokens_field: "max_completion_tokens",
+            notice: Some(
+                "检测到 OpenAI 推理系模型：不支持 temperature 等采样参数，已自动适配（省略该参数，输出上限改用 max_completion_tokens 字段）。如遇异常推荐使用 DeepSeek。",
+            ),
+        };
+    }
+    PARAM_DEFAULT
 }
 
 pub struct LlmClient {
@@ -182,7 +304,7 @@ impl LlmClient {
                     .map(|c| format!("，缓存命中 ¥{c}/M"))
                     .unwrap_or_default();
                 format!(
-                    "内置价格表（快照 {PRICE_SNAPSHOT_DATE}，高峰口径，空闲减半{cache}；缓存命中部分已按命中价计）"
+                    "内置价格表（快照 {PRICE_SNAPSHOT_DATE}，按北京时间自动区分高峰/空闲：工作日 9–12、14–18 全价，其余时段半价{cache}；缓存命中部分已按命中价计）"
                 )
             }
             PriceSource::Config => "配置覆盖（config.toml / 设置页）".into(),
@@ -192,6 +314,11 @@ impl LlmClient {
     }
 
     /// chat/completions。json_mode=true 时请求 JSON 输出；端点不支持 response_format 时自动降级重试一次。
+    /// 所有调用一律带 thinking:{type:disabled}（本应用的任务都不需要思考；DeepSeek V4 等
+    /// 默认思考模型会把小预算的回答挤成空响应）。表外服务商双重兜底：400 按错误文本降级
+    /// 重试一次（点名 temperature/thinking/response_format 就剥离对应字段）；200 但 content
+    /// 空且有思考痕迹（reasoning_content 或 finish=length，字段被忽略的思考模型）则加倍
+    /// max_tokens 重试一次。
     pub async fn chat(
         &self,
         messages: &[ChatMessage],
@@ -199,28 +326,51 @@ impl LlmClient {
         json_mode: bool,
         max_tokens: u32,
     ) -> Result<ChatOutput, LlmError> {
+        let rule = builtin_param_rule(&self.base_url, &self.model);
         let url = format!("{}/chat/completions", self.base_url);
-        let build = |json_out: bool| {
+        let build = |json_out: bool, with_temp: bool, budget: u32, with_thinking: bool| {
             let mut body = json!({
                 "model": self.model,
                 "messages": messages
                     .iter()
                     .map(|m| json!({"role": m.role, "content": m.content}))
                     .collect::<Vec<_>>(),
-                "temperature": temperature,
-                "max_tokens": max_tokens,
                 "stream": false,
             });
+            if with_temp {
+                body["temperature"] = json!(temperature);
+            }
+            body[rule.max_tokens_field] = json!(budget);
+            if with_thinking {
+                body["thinking"] = json!({"type": "disabled"});
+            }
             if json_out {
                 body["response_format"] = json!({"type": "json_object"});
             }
             body
         };
-        let (mut status, mut text) = self.post(&url, build(json_mode)).await?;
-        if status == 400 && json_mode {
-            let r = self.post(&url, build(false)).await?;
-            status = r.0;
-            text = r.1;
+        let (mut status, mut text) =
+            self.post(&url, build(json_mode, !rule.omit_temperature, max_tokens, true)).await?;
+        if status == 400 {
+            let lower = text.to_ascii_lowercase();
+            let drop_temp = !rule.omit_temperature && lower.contains("temperature");
+            let drop_thinking = lower.contains("thinking");
+            // json_mode 下任何 400 都值得去掉 response_format 试一次（原降级行为保留）
+            if drop_temp || drop_thinking || json_mode {
+                let r = self
+                    .post(
+                        &url,
+                        build(
+                            !drop_thinking && json_mode,
+                            !drop_temp && !rule.omit_temperature,
+                            max_tokens,
+                            !drop_thinking,
+                        ),
+                    )
+                    .await?;
+                status = r.0;
+                text = r.1;
+            }
         }
         if !(200..300).contains(&status) {
             let msg = serde_json::from_str::<Value>(&text)
@@ -231,11 +381,32 @@ impl LlmClient {
         }
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| LlmError::Network(format!("响应解析失败: {e}")))?;
-        let content = v["choices"][0]["message"]["content"]
+        let mut content = v["choices"][0]["message"]["content"]
             .as_str()
-            .ok_or(LlmError::EmptyContent)?
+            .unwrap_or_default()
             .trim()
             .to_string();
+        // 空响应自救：思考模型（忽略 thinking 字段的）把 max_tokens 花光在 reasoning 上
+        if content.is_empty() {
+            let ch = &v["choices"][0];
+            let thought = !ch["message"]["reasoning_content"].as_str().unwrap_or_default().is_empty()
+                || ch["finish_reason"].as_str() == Some("length");
+            if thought && max_tokens < 8192 {
+                let budget = (max_tokens.saturating_mul(2)).min(8192);
+                let (s2, t2) = self
+                    .post(&url, build(json_mode, !rule.omit_temperature, budget, true))
+                    .await?;
+                if (200..300).contains(&s2) {
+                    if let Ok(v2) = serde_json::from_str::<Value>(&t2) {
+                        if let Some(c2) = v2["choices"][0]["message"]["content"].as_str() {
+                            if !c2.trim().is_empty() {
+                                content = c2.trim().to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if content.is_empty() {
             return Err(LlmError::EmptyContent);
         }
@@ -247,14 +418,28 @@ impl LlmClient {
                 .or_else(|| v["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64())
                 .unwrap_or(0),
         };
+        // DeepSeek 内置表按官方规则区分时段：高峰全价、空闲半价（北京时间自动判断）；
+        // 手动配置的价格（Config/LocalFree）按用户填写值原样计，不做时段折算。
         // 缓存命中的输入按命中价计（DeepSeek 约为全价的 1/30），缺失缓存价时按全价保守
+        let time_mult = if self.price_source == PriceSource::Builtin
+            && !beijing_peak(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            ) {
+            0.5
+        } else {
+            1.0
+        };
         let cost = self.price.map(|p| {
             let cached = usage.cached_prompt_tokens.min(usage.prompt_tokens) as f64;
             let fresh = usage.prompt_tokens as f64 - cached;
             let cache_price = p.cache_input_per_m.unwrap_or(p.input_per_m);
-            fresh / 1e6 * p.input_per_m
+            (fresh / 1e6 * p.input_per_m
                 + cached / 1e6 * cache_price
-                + usage.completion_tokens as f64 / 1e6 * p.output_per_m
+                + usage.completion_tokens as f64 / 1e6 * p.output_per_m)
+                * time_mult
         });
         Ok(ChatOutput { content, usage, model: self.model.clone(), cost_cny: cost })
     }
@@ -344,5 +529,263 @@ mod tests {
         // cached 超界（脏数据）被 clamp，不产生负数
         let clamped = cost(Usage { prompt_tokens: 1000, completion_tokens: 0, cached_prompt_tokens: 5000 }).unwrap();
         assert!((clamped - 1000.0 / 1e6 * 0.10).abs() < 1e-12);
+    }
+
+    #[test]
+    fn builtin_price_covers_v4_family_with_official_snapshot() {
+        // 2026-09-06 官方定价页核准（高峰口径）：vision-exp 与 v4-flash 同价、pro 与 reasoner 同档
+        let flash = builtin_price("deepseek-v4-flash").unwrap();
+        let vision = builtin_price("deepseek-v4-flash-vision-exp").unwrap();
+        assert_eq!((vision.input_per_m, vision.cache_input_per_m, vision.output_per_m), (3.0, Some(0.10), 9.0));
+        assert_eq!(vision.input_per_m, flash.input_per_m);
+        let pro = builtin_price("deepseek-v4-pro").unwrap();
+        assert_eq!((pro.input_per_m, pro.cache_input_per_m, pro.output_per_m), (9.0, Some(0.30), 27.0));
+    }
+
+    #[test]
+    fn beijing_peak_follows_deepseek_official_windows() {
+        // 硬时间戳经 Python datetime 对照核准（北京时间）：
+        // 高峰 = 工作日 9:00–12:00 与 14:00–18:00，其余（午休/早晚/周末）空闲半价
+        assert!(beijing_peak(1788746400), "周一 10:00 高峰");
+        assert!(!beijing_peak(1788753600), "周一 12:00 午休");
+        assert!(!beijing_peak(1788760740), "周一 13:59 午休");
+        assert!(beijing_peak(1788760800), "周一 14:00 高峰");
+        assert!(!beijing_peak(1788775200), "周一 18:00 峰结束");
+        assert!(!beijing_peak(1788660000), "周日 10:00 空闲");
+        assert!(!beijing_peak(1788591600), "周六 15:00 空闲");
+        assert!(!beijing_peak(1788742740), "周一 08:59 早于峰");
+    }
+
+    #[test]
+    fn parse_models_response_sorts_and_tolerates_garbage() {
+        let std = r#"{"object":"list","data":[{"id":"deepseek-reasoner"},{"id":"deepseek-chat"},{"id":"deepseek-chat"}]}"#;
+        assert_eq!(parse_models_response(std), vec!["deepseek-chat", "deepseek-reasoner"]);
+        // 缺 data / 非 JSON / 空串 → 空表（前端表现为"0 个模型"而非报错）
+        assert!(parse_models_response(r#"{"error":{"message":"nope"}}"#).is_empty());
+        assert!(parse_models_response("not json").is_empty());
+        assert!(parse_models_response("").is_empty());
+        // 空白 id 被过滤
+        let ws = r#"{"data":[{"id":"  "},{"id":"m1"}]}"#;
+        assert_eq!(parse_models_response(ws), vec!["m1"]);
+    }
+
+    #[test]
+    fn builtin_param_rule_matches_host_and_model_prefix() {
+        // Kimi/Moonshot host：省略 temperature，max_tokens 字段不变
+        let kimi = builtin_param_rule("https://api.moonshot.cn/v1", "kimi-k3");
+        assert!(kimi.omit_temperature);
+        assert_eq!(kimi.max_tokens_field, "max_tokens");
+        assert!(kimi.notice.is_some());
+        assert!(builtin_param_rule("https://api.moonshot.ai/v1", "kimi-k2.6").omit_temperature);
+        // OpenAI 推理系（不限 host）：省略 temperature + 换 max_completion_tokens
+        for model in ["o4-mini", "gpt-5.1", "o3", "gpt-5"] {
+            let r = builtin_param_rule("https://some-proxy.example.com/v1", model);
+            assert!(r.omit_temperature, "{model}");
+            assert_eq!(r.max_tokens_field, "max_completion_tokens", "{model}");
+        }
+        // 无约束：DeepSeek / GLM / 前缀近似的无辜模型（如 "o2" 不存在但防御性区分）
+        for (url, model) in [
+            ("https://api.deepseek.com/v1", "deepseek-chat"),
+            ("https://open.bigmodel.cn/api/paas/v4", "glm-5.3"),
+            ("https://x.example.com/v1", "k2-mini"), // 不含 kimi/moonshot host
+        ] {
+            let r = builtin_param_rule(url, model);
+            assert!(!r.omit_temperature, "{model}");
+            assert_eq!(r.max_tokens_field, "max_tokens");
+            assert!(r.notice.is_none(), "{model}");
+        }
+    }
+
+    /// 本地 mock chat/completions：请求体带 temperature 即 400（模拟 Kimi/OpenAI 推理系），
+    /// 否则 200 返回最小补全。用于验证规则适配与 400 降级重试。
+    async fn spawn_mock() -> (std::net::SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::response::IntoResponse;
+        use axum::routing::post as axum_post;
+        use axum::Json as AxJson;
+        use axum::Router;
+
+        let bodies: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            axum_post(move |body: String| {
+                let seen = seen.clone();
+                async move {
+                    let v: Value = serde_json::from_str(&body).unwrap();
+                    let reject_temp = v.get("temperature").is_some();
+                    seen.lock().unwrap().push(v);
+                    if reject_temp {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            AxJson(json!({"error": {"message": "Unsupported parameter: 'temperature' is not supported with this model."}})),
+                        )
+                            .into_response();
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        AxJson(json!({
+                            "choices": [{"message": {"content": " ok "}}],
+                            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, bodies)
+    }
+
+    fn client_for(addr: std::net::SocketAddr, model: &str) -> LlmClient {
+        LlmClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{addr}/v1"),
+            api_key: "test".into(),
+            model: model.into(),
+            price: None,
+            price_source: PriceSource::Unknown,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_adapts_param_rules_and_degrades_on_400() {
+        let (addr, bodies) = spawn_mock().await;
+        let msgs = [ChatMessage::user("hi")];
+
+        // 表内规则（模型前缀匹配，与 host 无关）：gpt-5 用 max_completion_tokens 且不带 temperature
+        client_for(addr, "gpt-5.1").chat(&msgs, 0.4, false, 100).await.unwrap();
+        // 表外模型：首发带 temperature 被 400，按错误文本剥离后重试成功
+        client_for(addr, "future-model").chat(&msgs, 0.4, false, 100).await.unwrap();
+
+        // 注：Kimi 的 host 规则无法对 mock host 生效（rule 按 base_url host 匹配），
+        // 其判定已由 builtin_param_rule_matches_host_and_model_prefix 单测覆盖。
+        let all = bodies.lock().unwrap();
+        assert_eq!(all.len(), 3, "gpt-5×1 + 表外降级×2");
+        // 全局关思考：所有请求都带 thinking:disabled
+        for (i, b) in all.iter().enumerate() {
+            assert_eq!(b["thinking"]["type"], "disabled", "req {i} 应带关思考字段");
+        }
+        let gpt5 = all[0].as_object().unwrap();
+        assert!(!gpt5.contains_key("temperature"));
+        assert!(gpt5.contains_key("max_completion_tokens"));
+        assert!(!gpt5.contains_key("max_tokens"));
+        assert!(all[1].as_object().unwrap().contains_key("temperature"), "表外首发带 temperature");
+        assert!(!all[2].as_object().unwrap().contains_key("temperature"), "降级重试已剥离");
+        assert_eq!(all[2]["model"], "future-model");
+    }
+
+    /// mock：请求体带 thinking 字段即 400（模拟不认识该字段的服务商）
+    async fn spawn_mock_rejects_thinking() -> (std::net::SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::response::IntoResponse;
+        use axum::routing::post as axum_post;
+        use axum::Json as AxJson;
+        use axum::Router;
+
+        let bodies: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            axum_post(move |body: String| {
+                let seen = seen.clone();
+                async move {
+                    let v: Value = serde_json::from_str(&body).unwrap();
+                    let reject_thinking = v.get("thinking").is_some();
+                    seen.lock().unwrap().push(v);
+                    if reject_thinking {
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            AxJson(json!({"error": {"message": "Unrecognized request argument: thinking."}})),
+                        )
+                            .into_response();
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        AxJson(json!({
+                            "choices": [{"message": {"content": " ok "}}],
+                            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, bodies)
+    }
+
+    #[tokio::test]
+    async fn chat_strips_thinking_on_400() {
+        let (addr, bodies) = spawn_mock_rejects_thinking().await;
+        let msgs = [ChatMessage::user("hi")];
+        client_for(addr, "future-model").chat(&msgs, 0.4, false, 100).await.unwrap();
+        let all = bodies.lock().unwrap();
+        assert_eq!(all.len(), 2, "首发 400 + 剥离 thinking 重试");
+        assert!(all[0].as_object().unwrap().contains_key("thinking"), "首发带 thinking");
+        assert!(!all[1].as_object().unwrap().contains_key("thinking"), "重试已剥离 thinking");
+    }
+
+    /// mock：首次 200 但只有 reasoning_content（思考耗尽预算的思考模型形态），
+    /// 再次请求（更大预算）返回正常 content。
+    async fn spawn_mock_thinking_eats_budget() -> (std::net::SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::response::IntoResponse;
+        use axum::routing::post as axum_post;
+        use axum::Json as AxJson;
+        use axum::Router;
+
+        let bodies: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            axum_post(move |body: String| {
+                let seen = seen.clone();
+                async move {
+                    let v: Value = serde_json::from_str(&body).unwrap();
+                    let first = seen.lock().unwrap().is_empty();
+                    seen.lock().unwrap().push(v);
+                    if first {
+                        // 忽略 thinking 字段的思考模型：预算全花在 reasoning 上
+                        return (
+                            axum::http::StatusCode::OK,
+                            AxJson(json!({
+                                "choices": [{
+                                    "message": {"role": "assistant", "content": "", "reasoning_content": "让我想一想……"},
+                                    "finish_reason": "length"
+                                }],
+                                "usage": {"prompt_tokens": 10, "completion_tokens": 512}
+                            })),
+                        )
+                            .into_response();
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        AxJson(json!({
+                            "choices": [{"message": {"content": " ok "}, "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, bodies)
+    }
+
+    #[tokio::test]
+    async fn chat_retries_with_doubled_budget_on_empty_content() {
+        let (addr, bodies) = spawn_mock_thinking_eats_budget().await;
+        let msgs = [ChatMessage::user("hi")];
+        let out = client_for(addr, "future-model").chat(&msgs, 0.4, false, 512).await.unwrap();
+        assert_eq!(out.content, "ok");
+        let all = bodies.lock().unwrap();
+        assert_eq!(all.len(), 2, "空响应自救：加倍预算重试一次");
+        assert_eq!(all[0]["max_tokens"], 512);
+        assert_eq!(all[1]["max_tokens"], 1024, "重试预算翻倍");
     }
 }

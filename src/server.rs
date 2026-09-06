@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use axum::extract::{Path as AxPath, Request, State};
+use axum::extract::{Path as AxPath, Query, Request, State};
 use axum::http::{header, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
@@ -104,6 +104,8 @@ pub async fn run(db: &Path, config_path: &Path, cfg: Config, open_browser: bool,
         .route("/api/usage", get(api_usage))
         .route("/api/settings", get(api_settings).post(api_settings_post))
         .route("/api/secrets", get(api_secrets_get).post(api_secrets_post))
+        .route("/api/llm/models", post(api_llm_models))
+        .route("/api/llm/hint", get(api_llm_hint))
         .route("/api/annotation", post(api_annotation))
         .route("/api/override", post(api_override))
         .route("/api/feedback", post(api_feedback))
@@ -183,15 +185,23 @@ fn effective_config(db: &Path, mut cfg: Config) -> Result<Config> {
                 }
             }
         }
-        // 价格覆盖（设置页可视化编辑；任一档填写即整体生效，覆盖内置表）
-        let pi = store.meta_get("ui_price_input").ok().flatten().and_then(|v| v.parse::<f64>().ok());
-        let pc = store.meta_get("ui_price_cache").ok().flatten().and_then(|v| v.parse::<f64>().ok());
-        let po = store.meta_get("ui_price_output").ok().flatten().and_then(|v| v.parse::<f64>().ok());
-        if let (Some(i), Some(o)) = (pi, po) {
-            if let Some(p) = active_llm_profile_mut(&mut cfg) {
-                p.price_input_per_m = Some(i);
-                p.price_cache_per_m = pc;
-                p.price_output_per_m = Some(o);
+        // 价格覆盖（设置页可视化编辑；任一档填写即整体生效，覆盖内置表）。
+        // 覆盖与「保存时的模型名」绑定：换模型后旧覆盖不再生效，自动回退内置表——
+        // 否则给旧模型配的价格会一路错算到新模型上（真机反馈）。
+        // 匹配规则与遗留清洗见 meta_price_override（hint 端点同一份逻辑）。
+        if let Some(model) = cfg
+            .agent
+            .active_llm
+            .as_ref()
+            .and_then(|n| cfg.llm.get(n))
+            .map(|p| p.model.clone())
+        {
+            if let Some((i, c, o)) = meta_price_override(&store, &model) {
+                if let Some(p) = active_llm_profile_mut(&mut cfg) {
+                    p.price_input_per_m = Some(i);
+                    p.price_cache_per_m = c;
+                    p.price_output_per_m = Some(o);
+                }
             }
         }
         // 服务档案名：把覆盖后的 profile 以自定义名重新入表（显示名/配置引用一致）
@@ -215,6 +225,27 @@ fn effective_config(db: &Path, mut cfg: Config) -> Result<Config> {
 fn active_llm_profile_mut(cfg: &mut Config) -> Option<&mut crate::config::LlmProfile> {
     let name = cfg.agent.active_llm.clone()?;
     cfg.llm.get_mut(&name)
+}
+
+/// meta 价格覆盖（设置页三档）是否适用于该模型，适用则返回 (输入, 缓存, 输出)：
+/// - 有绑定（ui_price_model）须与给定模型一致——换模型后旧覆盖失效回退内置表；
+/// - 无绑定的历史值保持原行为生效，但恰为旧默认价形态（1.0/2.0 无缓存档，
+///   旧版设置页把预填价原样回发的产物）视为未配置；
+/// - 输入或输出缺失（半填/空）不算覆盖。
+/// effective_config 与 /api/llm/hint 共用，保证展示与实际生效同源。
+fn meta_price_override(store: &Store, model: &str) -> Option<(f64, Option<f64>, f64)> {
+    let pi = store.meta_get("ui_price_input").ok().flatten().and_then(|v| v.parse::<f64>().ok())?;
+    let po = store.meta_get("ui_price_output").ok().flatten().and_then(|v| v.parse::<f64>().ok())?;
+    let pc = store.meta_get("ui_price_cache").ok().flatten().and_then(|v| v.parse::<f64>().ok());
+    let bound = store.meta_get("ui_price_model").ok().flatten().filter(|v| !v.is_empty());
+    let applies = match bound {
+        Some(b) => b == model,
+        None => !(pi == 1.0 && po == 2.0 && pc.is_none()),
+    };
+    if !applies {
+        return None;
+    }
+    Some((pi, pc, po))
 }
 
 fn err_json(msg: impl std::fmt::Display) -> Json<serde_json::Value> {
@@ -523,6 +554,7 @@ async fn api_settings_post(State(app): State<Shared>, Json(req): Json<SettingsRe
         let _ = store.meta_set("ui_price_input", "");
         let _ = store.meta_set("ui_price_cache", "");
         let _ = store.meta_set("ui_price_output", "");
+        let _ = store.meta_set("ui_price_model", "");
     } else if let (Some(i), Some(o)) = (req.price_input, req.price_output) {
         if !(i.is_finite() && i >= 0.0 && o.is_finite() && o >= 0.0) {
             return err_json("价格必须是非负数字");
@@ -531,6 +563,29 @@ async fn api_settings_post(State(app): State<Shared>, Json(req): Json<SettingsRe
         if !cache_ok {
             return err_json("缓存命中价必须是非负数字");
         }
+        // 绑定目标模型：本次请求改了模型就绑新模型，否则绑当前生效模型——
+        // 换模型后此覆盖自动失效（effective_config 校验 ui_price_model）
+        let bound_model = req
+            .llm_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                store
+                    .meta_get("ui_llm_model")
+                    .ok()
+                    .flatten()
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| {
+                        let cfg = app.cfg.lock().unwrap();
+                        cfg.agent
+                            .active_llm
+                            .as_ref()
+                            .and_then(|n| cfg.llm.get(n))
+                            .map(|p| p.model.clone())
+                    })
+            });
         let _ = store.meta_set("ui_price_input", &format!("{i}"));
         let _ = store.meta_set("ui_price_output", &format!("{o}"));
         match req.price_cache {
@@ -540,6 +595,9 @@ async fn api_settings_post(State(app): State<Shared>, Json(req): Json<SettingsRe
             None => {
                 let _ = store.meta_set("ui_price_cache", "");
             }
+        }
+        if let Some(m) = bound_model {
+            let _ = store.meta_set("ui_price_model", &m);
         }
     }
     // 热更新内存配置。必须从 config.toml 重读原始值再套 meta 覆盖——直接在内存 cfg 上叠加
@@ -638,6 +696,82 @@ async fn api_secrets_post(State(app): State<Shared>, Json(req): Json<SecretsReq>
         std::env::set_var(name, value);
     }
     Json(key_status(&cfg))
+}
+
+// ============ LLM 服务探测（获取模型列表）============
+
+#[derive(serde::Deserialize, Default)]
+struct LlmModelsReq {
+    /// 刚填还没保存的 base_url / key 优先（引导页主场景：填完直接拉取再保存）；
+    /// 留空则用当前生效配置的 base_url 与已存密钥
+    base_url: Option<String>,
+    key: Option<String>,
+}
+
+async fn api_llm_models(State(app): State<Shared>, body: String) -> impl IntoResponse {
+    let req = serde_json::from_str::<LlmModelsReq>(&body).unwrap_or_default();
+    let cfg = app.cfg.lock().unwrap().clone();
+    let profile = cfg.agent.active_llm.as_ref().and_then(|n| cfg.llm.get(n));
+    let base_url = req
+        .base_url
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| profile.map(|p| p.base_url.clone()));
+    // key 优先取请求值，否则按当前生效的变量名读环境变量（.env 启动时已加载）
+    let key = req
+        .key
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            profile
+                .and_then(|p| std::env::var(&p.api_key_env).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    let Some(base_url) = base_url else {
+        return err_json("未提供 base_url，且当前没有生效的 LLM 服务");
+    };
+    let Some(key) = key else {
+        return err_json("请先填写 LLM API Key");
+    };
+    match crate::llm::fetch_models(&base_url, &key).await {
+        Ok(models) => Json(json!({ "models": models })),
+        Err(e) => err_json(format!("{e:#}")),
+    }
+}
+
+/// 参数约束提示：按内置规则表匹配 base_url/model（省略的参数回退当前生效配置），
+/// 前端只展示 notice，不自带匹配逻辑。
+async fn api_llm_hint(
+    State(app): State<Shared>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let cfg = app.cfg.lock().unwrap().clone();
+    let profile = cfg.agent.active_llm.as_ref().and_then(|n| cfg.llm.get(n));
+    let base_url = q
+        .get("base_url")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| profile.map(|p| p.base_url.clone()))
+        .unwrap_or_default();
+    let model = q
+        .get("model")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| profile.map(|p| p.model.clone()))
+        .unwrap_or_default();
+    let rule = crate::llm::builtin_param_rule(&base_url, &model);
+    // 该模型将生效的价格：绑定匹配的覆盖优先，否则内置表/本地免费——
+    // 设置页/引导页切换模型时价格预填跟随此值（未被手动改过的字段）
+    let price = Store::open(&app.db)
+        .ok()
+        .and_then(|s| meta_price_override(&s, &model))
+        .map(|(i, c, o)| json!({"input": i, "cache": c, "output": o}))
+        .or_else(|| {
+            crate::llm::peek_builtin_price(&base_url, &model)
+                .map(|p| json!({"input": p.input_per_m, "cache": p.cache_input_per_m, "output": p.output_per_m}))
+        });
+    Json(json!({ "notice": rule.notice, "price": price }))
 }
 
 // ============ 首次引导（一次性向导）============
@@ -1179,6 +1313,56 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 mod tests {
     use super::friendly_sync_error;
     use crate::steam_client::SteamError;
+
+    #[test]
+    fn price_override_binds_to_model() {
+        // 价格覆盖与保存时的模型绑定：换模型后旧覆盖失效回退内置表；
+        // 无绑定键（v0.42 前旧数据）保持原行为继续生效
+        let dir = std::env::temp_dir().join(format!("tonight-price-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.toml");
+        let db_path = dir.join("test.db3");
+        let _ = std::fs::remove_file(&cfg_path);
+        let _ = std::fs::remove_file(&db_path);
+        let cfg = crate::config::load(&cfg_path).unwrap();
+        let store = super::Store::open(&db_path).unwrap();
+
+        // 换模型 + 覆盖绑在别的模型上：忽略，回退内置表
+        store.meta_set("ui_llm_model", "deepseek-v4-pro").unwrap();
+        store.meta_set("ui_price_input", "1.0").unwrap();
+        store.meta_set("ui_price_output", "2.0").unwrap();
+        store.meta_set("ui_price_model", "deepseek-chat").unwrap();
+        let eff = super::effective_config(&db_path, cfg.clone()).unwrap();
+        let p = eff.llm.get("deepseek").unwrap();
+        assert_eq!(p.model, "deepseek-v4-pro");
+        assert_eq!(p.price_input_per_m, None, "跨模型的旧覆盖应被忽略");
+        let (price, src) = crate::llm::resolve_price(p);
+        assert_eq!(src, crate::llm::PriceSource::Builtin);
+        assert_eq!(price.unwrap().input_per_m, 9.0, "v4-pro 内置价兜底");
+
+        // 绑定一致：覆盖生效
+        store.meta_set("ui_price_model", "deepseek-v4-pro").unwrap();
+        let eff2 = super::effective_config(&db_path, cfg.clone()).unwrap();
+        assert_eq!(eff2.llm.get("deepseek").unwrap().price_input_per_m, Some(1.0));
+
+        // 清除绑定键（旧数据形态）：自定义值保持原行为继续生效
+        // （effective_config 契约：入参必须是刚从 config.toml 读出的 fresh cfg）
+        store.meta_set("ui_price_model", "").unwrap();
+        store.meta_set("ui_price_input", "5.0").unwrap();
+        store.meta_set("ui_price_output", "6.0").unwrap();
+        let eff3 = super::effective_config(&db_path, cfg.clone()).unwrap();
+        assert_eq!(eff3.llm.get("deepseek").unwrap().price_input_per_m, Some(5.0));
+
+        // 遗留清洗：无绑定 + 恰为旧默认价（1.0/2.0 无缓存档）= 预填回发产物，视为未配置
+        store.meta_set("ui_price_input", "1.0").unwrap();
+        store.meta_set("ui_price_output", "2.0").unwrap();
+        store.meta_set("ui_price_cache", "").unwrap();
+        let eff4 = super::effective_config(&db_path, cfg).unwrap();
+        assert_eq!(eff4.llm.get("deepseek").unwrap().price_input_per_m, None, "旧默认价形态应回退内置表");
+
+        let _ = std::fs::remove_file(&cfg_path);
+        let _ = std::fs::remove_file(&db_path);
+    }
 
     #[tokio::test]
     async fn bind_falls_back_to_next_free_port() {

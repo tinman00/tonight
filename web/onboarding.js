@@ -55,8 +55,12 @@
       <div class="grid2">
         <div class="field"><label>接口地址 base_url</label>
           <input id="ob-base-url" class="ob-input" value="${esc(st.base_url || "https://api.deepseek.com/v1")}" placeholder="https://api.deepseek.com/v1"></div>
-        <div class="field"><label>模型名 model</label>
-          <input id="ob-model" class="ob-input" value="${esc(st.model || "deepseek-chat")}" placeholder="deepseek-chat"></div>
+        <div class="field"><label>模型名 model（可点「获取模型」拉取候选）</label>
+          <div style="display:flex;gap:8px">
+            <input id="ob-model" class="ob-input" value="${esc(st.model || "deepseek-chat")}" placeholder="deepseek-chat" list="ob-model-list">
+            <button class="btn" id="ob-model-fetch" style="white-space:nowrap">获取模型</button>
+            <datalist id="ob-model-list"></datalist>
+          </div></div>
       </div>
       <details class="ob-adv">
         <summary>自定义服务（非 DeepSeek：服务名 / 密钥变量名 / 价格）</summary>
@@ -74,6 +78,7 @@
         </div>
         <p>常见模型已内置价格（快照 2026-09），留空即可；第三方平台价差大，建议按其定价页填写，否则费用统计会失真。</p>
       </details>
+      <div class="ob-msg" id="ob-llm-hint" style="display:none"></div>
       <div class="check"><input type="checkbox" id="ob-auto-rec" ${st.auto_recommend !== false ? "checked" : ""}><label for="ob-auto-rec">打开页面自动推荐「猜你想玩」——按画像直接推一轮，省一次输入</label></div>
       <div class="check"><input type="checkbox" id="ob-llm-pos" ${st.llm_positioning ? "checked" : ""}><label for="ob-llm-pos">LLM 游戏定位增强——同步时对每款游戏做一次定位分析（缓存复用，少量额外 LLM 费用），画像与推荐更贴合动机类型</label></div>
       <div class="ob-msg" id="ob-msg"></div>
@@ -90,6 +95,54 @@
           llm_positioning: b.querySelector("#ob-llm-pos").checked,
         }),
       });
+    // 获取模型列表：用刚填还没保存的 base_url/key，成功后填入下拉建议（手动输入不受影响）
+    b.querySelector("#ob-model-fetch").onclick = async () => {
+      const msg = b.querySelector("#ob-msg");
+      msg.textContent = "获取模型列表中…";
+      try {
+        const r = await api("/api/llm/models", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            base_url: b.querySelector("#ob-base-url").value.trim(),
+            key: b.querySelector("#ob-llm-key").value.trim() || null,
+          }),
+        });
+        b.querySelector("#ob-model-list").innerHTML = r.models.map((m) => `<option value="${esc(m)}">`).join("");
+        msg.textContent = `✔ 已获取 ${r.models.length} 个模型，点击模型名输入框即可选择`;
+      } catch (e) {
+        msg.textContent = "✖ " + e.message +
+          (e.message.includes("404") ? "（确认 base_url 是否包含 /v1）" : "");
+      }
+    };
+    // 价格字段只在用户改过后才提交（预填值原样回发会把旧价固化成 meta 覆盖）；
+    // 声明在 llmHint 之前——提示刷新会读它判断是否同步价格预填
+    let priceDirty = false;
+    ["#ob-price-in", "#ob-price-cache", "#ob-price-out"].forEach((id) =>
+      b.querySelector(id).addEventListener("input", () => { priceDirty = true; }));
+    // 参数约束提示 + 价格跟随：规则匹配在后端，前端只展示 notice；
+    // syncPrice=true（模型/base_url 被改动时）且价格未被手动改过 → 预填同步为该模型
+    // 将生效的价格（绑定覆盖优先，否则内置表，未知则清空待填）。初始渲染不同步，
+    // 保留 bootstrap 返回的当前生效价。
+    const hintEl = b.querySelector("#ob-llm-hint");
+    const llmHint = async (syncPrice) => {
+      try {
+        const r = await api(`/api/llm/hint?base_url=${encodeURIComponent(b.querySelector("#ob-base-url").value.trim())}&model=${encodeURIComponent(b.querySelector("#ob-model").value.trim())}`);
+        hintEl.textContent = r.notice || "";
+        hintEl.style.display = r.notice ? "block" : "none";
+        if (syncPrice && !priceDirty) {
+          b.querySelector("#ob-price-in").value = r.price ? r.price.input : "";
+          b.querySelector("#ob-price-cache").value = r.price && r.price.cache != null ? r.price.cache : "";
+          b.querySelector("#ob-price-out").value = r.price ? r.price.output : "";
+          const ph = r.price ? "内置价格表自动" : "该模型不在内置价格表，建议按官方定价填写";
+          b.querySelector("#ob-price-in").placeholder = ph;
+          b.querySelector("#ob-price-out").placeholder = ph;
+        }
+      } catch { /* 提示失败不影响使用 */ }
+    };
+    b.querySelector("#ob-base-url").addEventListener("input", () => llmHint(true));
+    b.querySelector("#ob-model").addEventListener("input", () => llmHint(true));
+    llmHint();
     b.querySelector("#ob-later").onclick = async () => {
       try { await savePrefs(); } catch (e) { /* 偏好保存失败不阻塞进入 */ }
       step = 2;
@@ -117,10 +170,12 @@
             llm_model: b.querySelector("#ob-model").value.trim(),
             llm_name: b.querySelector("#ob-llm-name").value.trim(),
             llm_key_env: b.querySelector("#ob-key-env").value.trim(),
-            // 价格：输入/输出都填了才提交覆盖（半填状态视为未改）
-            price_input: pin !== null && pout !== null ? pin : undefined,
-            price_cache: pin !== null && pout !== null ? num("#ob-price-cache") : undefined,
-            price_output: pin !== null && pout !== null ? pout : undefined,
+            // 价格：用户改过且输入/输出都填了才提交（预填回发与半填状态都视为未改）
+            ...(priceDirty && pin !== null && pout !== null ? {
+              price_input: pin,
+              price_cache: num("#ob-price-cache"),
+              price_output: pout,
+            } : {}),
             auto_recommend: b.querySelector("#ob-auto-rec").checked,
             llm_positioning: b.querySelector("#ob-llm-pos").checked,
           }),

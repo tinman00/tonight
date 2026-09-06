@@ -34,8 +34,9 @@ base_url = "https://api.deepseek.com/v1"
 api_key_env = "DEEPSEEK_API_KEY"
 model = "deepseek-chat"
 context_tokens = 65536
-price_input_per_m = 1.0   # CNY / 1M tokens
-price_output_per_m = 2.0
+# 价格不在此配置：DeepSeek 系模型走内置价格表（官方定价快照 + 高峰/空闲时段自动判断，
+# 见 llm.rs builtin_price / beijing_peak）。需要自定义价格时在设置页填，或在此写
+# price_input_per_m / price_cache_per_m / price_output_per_m 覆盖（输入+输出齐填生效）。
 
 [profile]
 idle_min_minutes = 300
@@ -206,5 +207,20 @@ pub fn load(path: &Path) -> Result<Config> {
     }
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("读取配置失败: {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("解析配置失败: {}", path.display()))
+    let mut cfg: Config =
+        toml::from_str(&text).with_context(|| format!("解析配置失败: {}", path.display()))?;
+    // 迁移：旧版默认配置把 V3 时代的 deepseek 价格（1.0/2.0）直接写进了 [llm.deepseek]，
+    // 而 Config 层优先于内置价格表——旧文件不清理的话，切任何 DeepSeek 模型都按旧价计费
+    // （真机反馈"v4-pro 计费没同步"的根因）。只清与旧默认完全一致的值（用户自定义不动），
+    // 不改写用户文件，每次加载幂等生效。
+    if let Some(p) = cfg.llm.get_mut("deepseek") {
+        if p.price_input_per_m == Some(1.0)
+            && p.price_output_per_m == Some(2.0)
+            && p.price_cache_per_m.is_none()
+        {
+            p.price_input_per_m = None;
+            p.price_output_per_m = None;
+        }
+    }
+    Ok(cfg)
 }

@@ -1043,9 +1043,14 @@ async function loadSettings() {
           <input id="set-key-env" style="${inputStyle}" value="${esc(s.llm_key_env || "")}" placeholder="DEEPSEEK_API_KEY"></div>
         <div class="field"><label>接口地址 base_url</label>
           <input id="set-base-url" style="${inputStyle}" value="${esc(s.base_url || "")}" placeholder="https://api.deepseek.com/v1"></div>
-        <div class="field"><label>模型名 model</label>
-          <input id="set-model" style="${inputStyle}" value="${esc(s.llm.model || "")}" placeholder="deepseek-chat"></div>
+        <div class="field"><label>模型名 model（可点「获取模型」从服务端拉取候选）</label>
+          <div style="display:flex;gap:8px">
+            <input id="set-model" style="${inputStyle}" value="${esc(s.llm.model || "")}" placeholder="deepseek-chat" list="set-model-list">
+            <button class="btn" id="set-model-fetch" style="white-space:nowrap">获取模型</button>
+            <datalist id="set-model-list"></datalist>
+          </div></div>
       </div>
+      <div id="set-llm-hint" style="display:none;color:var(--orange);font-size:12px;margin:6px 2px 0"></div>
       <div class="grid2" style="margin-top:2px">
         <div class="field"><label>价格 · 输入（元/百万 tokens，缓存未命中）</label>
           <input type="number" id="set-price-in" style="${inputStyle}" step="0.05" min="0" value="${s.price_input ?? ""}" placeholder="内置价格表自动"></div>
@@ -1110,6 +1115,11 @@ async function loadSettings() {
       loadMini();
       loadSettings();
     });
+    // 价格字段只在用户改过后才提交——预填值原样回发会把旧价固化成 meta 覆盖，
+    // 换模型后仍然生效（计费错乱的来源之一）
+    let priceDirty = false;
+    ["#set-price-in", "#set-price-cache", "#set-price-out"].forEach((id) =>
+      $(id).addEventListener("input", () => { priceDirty = true; }));
     // 密钥与端点：key 有输入才 POST /api/secrets；base_url/model 走 /api/settings（meta 热更新）
     $("#set-keys-save").addEventListener("click", async () => {
       const msg = $("#keys-msg");
@@ -1132,10 +1142,12 @@ async function loadSettings() {
             llm_model: $("#set-model").value.trim(),
             llm_name: $("#set-llm-name").value.trim(),
             llm_key_env: $("#set-key-env").value.trim(),
-            // 价格：输入/输出都填了才提交覆盖（半填状态视为未改）
-            price_input: pin !== null && pout !== null ? pin : undefined,
-            price_cache: pin !== null && pout !== null ? num("#set-price-cache") : undefined,
-            price_output: pin !== null && pout !== null ? pout : undefined,
+            // 价格：用户改过且输入/输出都填了才提交（预填回发与半填状态都视为未改）
+            ...(priceDirty && pin !== null && pout !== null ? {
+              price_input: pin,
+              price_cache: num("#set-price-cache"),
+              price_output: pout,
+            } : {}),
           }),
         });
         if (steamKey || llmKey) {
@@ -1155,6 +1167,49 @@ async function loadSettings() {
         msg.textContent = "✖ " + e.message;
       }
     });
+    // 获取模型列表：优先用刚填还没保存的 base_url/key；成功后填入下拉建议（手动输入不受影响）
+    $("#set-model-fetch").addEventListener("click", async () => {
+      const msg = $("#keys-msg");
+      msg.textContent = "获取模型列表中…";
+      try {
+        const r = await api("/api/llm/models", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            base_url: $("#set-base-url").value.trim(),
+            key: $("#set-llm-key").value.trim() || null,
+          }),
+        });
+        $("#set-model-list").innerHTML = r.models.map((m) => `<option value="${esc(m)}">`).join("");
+        msg.textContent = `✔ 已获取 ${r.models.length} 个模型，点击模型名输入框即可选择`;
+      } catch (e) {
+        msg.textContent = "✖ " + e.message +
+          (e.message.includes("404") ? "（确认 base_url 是否包含 /v1）" : "");
+      }
+    });
+    // 参数约束提示 + 价格跟随：规则匹配在后端，前端只展示 notice；
+    // syncPrice=true（模型/base_url 被改动时）且价格字段未被手动改过 → 预填同步为
+    // 该模型将生效的价格（绑定覆盖优先，否则内置表，未知则清空待填）。
+    // 初始渲染不传 syncPrice，保留 /api/settings 返回的当前生效价。
+    const llmHint = async (syncPrice) => {
+      try {
+        const r = await api(`/api/llm/hint?base_url=${encodeURIComponent($("#set-base-url").value.trim())}&model=${encodeURIComponent($("#set-model").value.trim())}`);
+        const el = $("#set-llm-hint");
+        el.textContent = r.notice || "";
+        el.style.display = r.notice ? "block" : "none";
+        if (syncPrice && !priceDirty) {
+          $("#set-price-in").value = r.price ? r.price.input : "";
+          $("#set-price-cache").value = r.price && r.price.cache != null ? r.price.cache : "";
+          $("#set-price-out").value = r.price ? r.price.output : "";
+          const ph = r.price ? "内置价格表自动" : "该模型不在内置价格表，建议按官方定价填写";
+          $("#set-price-in").placeholder = ph;
+          $("#set-price-out").placeholder = ph;
+        }
+      } catch { /* 提示失败不影响使用 */ }
+    };
+    $("#set-base-url").addEventListener("input", () => llmHint(true));
+    $("#set-model").addEventListener("input", () => llmHint(true));
+    llmHint();
     // 恢复内置价格（清空覆盖，回到快照表/config 默认）
     $("#set-price-reset").addEventListener("click", async () => {
       await api("/api/settings", {

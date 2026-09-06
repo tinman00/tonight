@@ -1,0 +1,41 @@
+# 「今晚玩什么」配置文件
+# 密钥不要写在这里：放 .env（参考 .env.example），此处只写环境变量名。
+
+[steam]
+# Steam 安装目录；留空则自动检测（Windows 注册表 → 常见路径）
+install_dir = ""
+# Steam Web API Key 从哪个环境变量读取
+api_key_env = "STEAM_WEB_API_KEY"
+
+[agent]
+active_llm = "deepseek"
+thinking_mode = false
+daily_budget_cny = 2.0
+
+[llm.deepseek]
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek-chat"
+context_tokens = 65536
+# price_input_per_m（留空用内置价格表）
+# price_output_per_m
+
+[profile]
+idle_min_minutes = 300
+idle_easy_rate = 0.20
+# 里程碑通关判定：获得「通关标记类成就且全球完成度 ≤ 阈值%」即视为已完成
+# （v2 成就分类收紧后从 35 放宽：容纳热门/老游戏的高完成度终点成就，如 Portal 的 BEAT_GAME 全球 52%）
+finished_mark_max_pct = 55.0
+
+[recommender]
+top_m = 10
+w_motiv = 0.30
+w_tag = 0.20
+w_attain = 0.15
+w_session = 0.15
+w_ready = 0.10
+w_backlog = 0.10
+
+[network]
+# 访问 Steam API 的代理；留空 = 自动（环境变量 → Windows 系统代理）
+proxy = ""

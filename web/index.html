@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>今晚玩什么 · Steam 游戏库推荐 Agent</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand">
+      <div class="logo">🎮</div>
+      <div class="bt"><b>今晚玩什么</b><span>Steam 库内推荐 Agent</span></div>
+    </div>
+    <nav id="nav">
+      <button data-tab="chat" class="active"><span class="ic">💬</span>对话推荐</button>
+      <button data-tab="library"><span class="ic">🎲</span>游戏库存</button>
+      <button data-tab="profile"><span class="ic">🧭</span>玩家画像</button>
+      <button data-tab="history"><span class="ic">🕘</span>历史会话</button>
+      <button data-tab="settings"><span class="ic">⚙️</span>设置</button>
+    </nav>
+    <div class="side-foot">
+      <div class="u-line"><div class="u-v" id="mini-today">¥—</div><div class="u-k">今日 / 预算</div></div>
+      <div class="u-line"><div class="u-v" id="mini-model">—</div><div class="u-k">模型</div></div>
+    </div>
+  </aside>
+
+  <main>
+    <!-- 对话 -->
+    <section id="tab-chat" class="tab active">
+      <div id="sync-banner" class="banner hidden"></div>
+      <div id="chat-viewport">
+        <div id="pages">
+          <div id="chat-empty" class="fullpage">
+            <div class="big" id="empty-title">今晚，玩什么？</div>
+            <div class="hint-line">像这样开始 ——「想玩点轻松的，一个小时」</div>
+            <div class="quick-row" id="quick-row"></div>
+            <div class="hint-line dim">滚轮 / ↑↓ 切换轮次 · ‹ › 或 ←→ 浏览推荐</div>
+          </div>
+        </div>
+        <div id="page-dots"></div>
+      </div>
+      <form id="chat-form" autocomplete="off">
+        <input id="chat-input" placeholder="说说现在想玩什么…（Enter 发送，留空=随便来点）">
+        <button type="submit" id="chat-send">发送</button>
+      </form>
+    </section>
+
+    <!-- 库存 -->
+    <section id="tab-library" class="tab">
+      <div id="library-body" class="pane">加载中…</div>
+    </section>
+
+    <!-- 画像 -->
+    <section id="tab-profile" class="tab">
+      <div id="profile-body" class="pane">加载中…</div>
+    </section>
+
+    <!-- 历史 -->
+    <section id="tab-history" class="tab">
+      <div id="session-list" class="pane">加载中…</div>
+      <div id="session-view" class="pane hidden"></div>
+    </section>
+
+    <!-- 设置 -->
+    <section id="tab-settings" class="tab">
+      <div id="settings-body" class="pane">加载中…</div>
+    </section>
+  </main>
+</div>
+
+<div id="onboarding" class="ob-overlay hidden"></div>
+
+<script src="app.js"></script>
+<script src="onboarding.js"></script>
+</body>
+</html>

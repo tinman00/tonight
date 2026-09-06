@@ -1,0 +1,32 @@
+# ===== 密钥与环境（严禁提交，含注册信息）=====
+steam-web-api-key.txt
+*.key.txt
+.env
+.env.*
+!.env.example
+
+# ===== 本地数据（含个人游玩数据/会话记录）=====
+*.sqlite
+*.sqlite3
+*.db
+data/
+
+# ===== Rust 构建产物 =====
+/target
+/dist
+**/*.rs.bk
+
+# ===== IDE / OS =====
+.idea/
+.vscode/
+.zcode/
+Thumbs.db
+.DS_Store
+
+# ===== 运行日志 =====
+*.log
+
+# ===== 本地材料（不进仓库）=====
+/project-requirements/
+/design.md
+/topic-post.md

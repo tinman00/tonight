@@ -1,0 +1,4 @@
+# bat files must keep CRLF: cmd mis-parses LF-only scripts
+*.bat text eol=crlf
+# sh files must keep LF: bash chokes on CRLF
+*.sh text eol=lf

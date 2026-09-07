@@ -41,6 +41,9 @@ context_tokens = 65536
 [profile]
 idle_min_minutes = 300
 idle_easy_rate = 0.20
+# 剧情覆盖率判通关（v0.46）：拿到 ≥80% 的剧情/通关类成就（合作/竞技不计入分母）
+# 即视为已完成主线——非成就党通关路径；成就数 <10 的游戏信号弱，要求全拿
+story_finish_rate = 0.80
 
 [recommender]
 top_m = 10
@@ -133,6 +136,11 @@ pub struct ProfileCfg {
     /// 现在分类保守（拿不准不给）+ 2 小时 playtime 门槛 + 手动标注兜底，
     /// 可以容纳热门/老游戏的高完成度终点成就（Portal 初代 BEAT_GAME 全球 52% 曾被挡）
     pub finished_mark_max_pct: f64,
+    /// 剧情覆盖率判通关（v0.46）：拿到 ≥ 此比例的剧情/通关类成就即视为完成主线。
+    /// 非成就党通关路径：通关者会拿到几乎全部主线推进成就，但总完成度可能远低于 80%
+    /// （传送门2 真机：35% 完成度、结局成就被分到 story、全库无 completion 项）。
+    /// 仅对剧情类成就 ≥10 项的游戏生效；<10 项信号弱，要求全拿。
+    pub story_finish_rate: f64,
 }
 
 impl Default for ProfileCfg {
@@ -141,6 +149,7 @@ impl Default for ProfileCfg {
             idle_min_minutes: 300,
             idle_easy_rate: 0.20,
             finished_mark_max_pct: 55.0,
+            story_finish_rate: 0.80,
         }
     }
 }

@@ -654,7 +654,10 @@ async function loadLibrary() {
       html += `<div class="panel anomaly-panel">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
           <h4 style="margin:0">⚠ 识别异常（${anomalies.length}）</h4>
-          <button class="btn primary" id="lib-repair" ${dataKind ? "" : "disabled title='没有可自动修复的数据异常，用列表中的手动标注处理'"}>⟳ 尝试自动修复${dataKind ? `（${dataKind} 项数据缺失）` : ""}</button>
+          <span style="display:flex;gap:8px">
+            ${judge.length >= 2 ? `<button class="btn green" id="lib-mark-all-done" title="把下面所有「疑似已玩完」一键标为已完成（可逐个改回）">✓ 全部已玩完（${judge.length}）</button>` : ""}
+            <button class="btn primary" id="lib-repair" ${dataKind ? "" : "disabled title='没有可自动修复的数据异常，用列表中的手动标注处理'"}>⟳ 尝试自动修复${dataKind ? `（${dataKind} 项数据缺失）` : ""}</button>
+          </span>
         </div>
         <div class="muted" style="margin:6px 0 10px">数据缺失的重新联网拉取；疑似漏识别的用右侧按钮手动标注，标注后不再提示。</div>
         <div id="lib-repair-log" class="hidden"></div>
@@ -703,6 +706,23 @@ async function loadLibrary() {
       btn.textContent = "⌂ 更新本地状态";
       loadLibrary();
     });
+    // 「全部已玩完」：一键把所有疑似完成批量标为已完成（批量覆盖端点，可逐个改回）
+    const markAllBtn = $("#lib-mark-all-done");
+    if (markAllBtn) {
+      markAllBtn.addEventListener("click", async () => {
+        markAllBtn.disabled = true;
+        const ids = [...body.querySelectorAll(".anomaly-item .ops [data-act='mark-done']")]
+          .map((b) => Number(b.dataset.app));
+        try {
+          await api("/api/override", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ app_ids: ids, kind: "depth", value: "已完成" }),
+          });
+        } catch (e) { /* api() 已弹错 */ }
+        loadLibrary();
+      });
+    }
     const repairBtn = $("#lib-repair");
     if (repairBtn) {
       repairBtn.addEventListener("click", async () => {
@@ -806,7 +826,7 @@ function renderLibraryEmpty(body) {
     </div>
     <div id="lib-sync-log" class="hidden"></div>
     <div class="muted" style="margin-top:8px">
-      SteamID64 在哪看：Steam 个人资料页地址 …/profiles/ 后面的 17 位数字。首次同步约 2–5 分钟，之后增量秒级。
+      SteamID64 在哪看：Steam 个人资料页地址 …/profiles/ 后面的 17 位数字。首次同步视库大小约 3–15 分钟（数百款游戏时偏上限），之后增量秒级。
     </div>
   </div>`;
   $("#lib-sync").addEventListener("click", () => runLibrarySync());
@@ -1098,7 +1118,7 @@ async function loadSettings() {
         <button class="btn red" id="sync-stop">停止</button>
       </div>
       <div id="sync-log">（同步日志）</div>
-      <div class="muted" style="margin-top:8px">首次同步含商店标签与成就类型分析（LLM），约 2–5 分钟；此后增量秒级。所有数据仅存本地。也可以在「游戏库存」页直接点「更新游戏库」。</div>
+      <div class="muted" style="margin-top:8px">首次同步含商店详情/标签与成就类型分析（LLM），视库大小约 3–15 分钟（Steam 商店接口限速所致，开始后进度里有更准的预估）；此后增量秒级。所有数据仅存本地。也可以在「游戏库存」页直接点「更新游戏库」。</div>
     </div>`;
     $("#set-save").addEventListener("click", async () => {
       await api("/api/settings", {

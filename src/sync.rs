@@ -1,9 +1,13 @@
-//! 同步编排（design.md §7.7 分层取数）：Tier A（库清单）→ E（本地安装）→ Tier B（玩家成就）
-//! → Tier C（全球完成度）→ Tier D（商店详情与用户标签）→ Tier F（成就类型分析）。
+//! 同步编排（design.md §7.7 分层取数）：Tier A（库清单）→ E（本地安装）→
+//! [Tier B（玩家成就）∥ Tier C（全球完成度）∥ Tier D（商店详情与用户标签）并行取数]
+//! → Tier F（成就类型分析）。
 //! 事件化：进度经 `progress` 回调上报（CLI 打印 / Web 转 SSE），`cancel` 支持随时打断（R4）。
+//! v0.47 并行化：三条限速域（Web API 8/s ∥ 商店 api 36/min ∥ 商店页 60/min）独立推进；
+//! 网络请求在生成者任务里跑（并发上限只藏 RTT），DB 写入集中在主循环——rusqlite 连接不跨任务共享。
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -11,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::llm::LlmClient;
-use crate::models::AppDetail;
-use crate::steam_client::{SteamClient, SteamStore};
+use crate::models::{Achievement, AppDetail};
+use crate::steam_client::{SteamClient, SteamError, SteamStore};
 use crate::steam_local::{self, SteamLocal};
 use crate::store::Store;
 
@@ -21,6 +25,15 @@ pub struct SyncOptions {
     pub vanity: Option<String>,
     pub local_only: bool,
     pub skip_llm: bool,
+}
+
+/// 并行取数结果：生成者任务只做网络请求，结果发回主循环由消费者串行写库
+enum Fetched {
+    PlayerAch { app_id: u32, name: String, res: Result<Option<Vec<Achievement>>, SteamError> },
+    Global { app_id: u32, res: Result<Option<Vec<(String, f32)>>, SteamError> },
+    Detail { app_id: u32, res: Result<Option<AppDetail>, SteamError> },
+    Tags { app_id: u32, res: Result<Option<(Vec<String>, Option<f64>)>, SteamError> },
+    Storage { app_id: u32, res: Result<Option<(Vec<String>, Option<f64>)>, SteamError> },
 }
 
 pub async fn run(
@@ -68,161 +81,266 @@ pub async fn run(
     // E 层：本地安装状态
     refresh_local(&store, &local, progress)?;
 
-    // Tier B：玩家成就
+    // Tier B（玩家成就）∥ Tier C（全球完成度）∥ Tier D（商店详情/标签/存储回填）：
+    // 一次性领完所有待办（Tier C/D 原本要等 B 串行跑完，30 分钟的大头就在这里），
+    // 三条限速域并行推进；玩过的游戏优先——中断时画像真正要用的数据（口味/深度判定）已先入库
     let played = store.played_games()?;
     let skipped: HashSet<u32> = store.skipped_apps()?.into_iter().map(|(id, _)| id).collect();
-    let todo: Vec<_> = played.iter().filter(|g| !skipped.contains(&g.app_id)).collect();
-    progress(&format!(
-        "[3/6] 玩家成就：待拉取 {} 款（玩过 {} 款，其余已标记跳过）",
-        todo.len(),
-        played.len()
-    ));
+    let todo: Vec<(u32, String)> = played
+        .iter()
+        .filter(|g| !skipped.contains(&g.app_id))
+        .map(|g| (g.app_id, g.name.clone()))
+        .collect();
+    let need_global = store.owned_without_global()?;
+    let mut need_details = store.owned_without_details()?;
+    let mut need_tags = store.owned_without_tags()?;
+    let mut need_storage = store.owned_without_storage()?;
+    let played_ids: HashSet<u32> = played.iter().map(|g| g.app_id).collect();
+    for v in [&mut need_details, &mut need_tags, &mut need_storage] {
+        v.sort_unstable_by_key(|id| !played_ids.contains(id));
+    }
 
     let t0 = Instant::now();
     let mut interrupted = false;
-    let mut failed = 0usize;
-    let mut done = 0usize;
-    for (idx, g) in todo.iter().enumerate() {
-        if interrupted || cancel.is_cancelled() {
-            interrupted = true;
-            break;
-        }
-        match client.get_player_achievements(&steamid, g.app_id).await {
-            Ok(Some(achs)) => {
-                store.upsert_achievements(g.app_id, &achs)?;
-                progress(&format!("  [{:>3}/{}] {}：{} 项成就", idx + 1, todo.len(), g.name, achs.len()));
-            }
-            Ok(None) => {
-                store.mark_skipped(g.app_id, "无成就或不可用")?;
-                progress(&format!("  [{:>3}/{}] {}：跳过（无成就或不可用）", idx + 1, todo.len(), g.name));
-            }
-            Err(e) => {
-                failed += 1;
-                tracing::error!("{}：{e}", g.name);
-            }
-        }
-        done += 1;
-    }
+    let (mut b_done, mut b_failed) = (0usize, 0usize);
 
-    // Tier C：全球成就完成度（免 Key，注水判定/稀有成就/可达性/候选侧定位的难度信号；范围全库）
-    if !interrupted {
-        let need_global = store.owned_without_global()?;
-        if need_global.is_empty() {
-            progress("[4/6] 全球成就完成度：已是最新");
-        } else {
-            progress(&format!("[4/6] 全球成就完成度：{} 款（免 Key）", need_global.len()));
-            for (i, app_id) in need_global.iter().enumerate() {
-                if interrupted || cancel.is_cancelled() {
-                    interrupted = true;
-                    break;
-                }
-                match client.get_global_achievement_percentages(*app_id).await {
-                    Ok(Some(rows)) => {
-                        store.upsert_global_achievements(*app_id, &rows)?;
-                    }
-                    Ok(None) => {
-                        store.mark_skipped(*app_id, "无成就（global）")?;
-                    }
-                    Err(e) => tracing::error!("app {app_id} 全球完成度拉取失败: {e}"),
-                }
-                if (i + 1) % 10 == 0 {
-                    progress(&format!("  … {}/{}", i + 1, need_global.len()));
-                }
-            }
-        }
-    }
+    if todo.is_empty()
+        && need_global.is_empty()
+        && need_details.is_empty()
+        && need_tags.is_empty()
+        && need_storage.is_empty()
+    {
+        progress("[3-5/6] 玩家成就 / 全球完成度 / 商店数据：已是最新");
+    } else {
+        // 预计时间 = 三条限速域各自的墙钟下限取最大，再放宽 20% 兜 RTT 与重试
+        let web_min = (todo.len() + need_global.len()) as f64 / 8.0 / 60.0;
+        let api_min = need_details.len() as f64 / 36.0;
+        let page_min = (need_tags.len() + need_storage.len()) as f64 / 60.0;
+        let eta = (web_min.max(api_min).max(page_min) * 1.2).ceil() as u64;
+        progress(&format!(
+            "[3-5/6] 并行拉取：玩家成就 {} 款（玩过 {} 款，其余已标记跳过）· 全球完成度 {} · 详情 {} · 标签 {} · 存储回填 {}",
+            todo.len(),
+            played.len(),
+            need_global.len(),
+            need_details.len(),
+            need_tags.len(),
+            need_storage.len()
+        ));
+        progress(&format!(
+            "      预计网络阶段约 {} 分钟（Web API 与商店双通道并行，商店接口限速 36 次/分 + 页面 60 次/分）",
+            eta
+        ));
 
-    // Tier D：商店详情（长期缓存）+ 用户投票标签（glance_tags，一次性缓存）+ 存储需求回填
-    if !interrupted {
-        let need_details = store.owned_without_details()?;
-        let need_tags = store.owned_without_tags()?;
-        let need_storage = store.owned_without_storage()?;
-        if need_details.is_empty() && need_tags.is_empty() && need_storage.is_empty() {
-            progress("[5/6] 商店详情与用户标签：已是最新");
-        } else {
-            progress(&format!(
-                "[5/6] 商店详情与用户标签：详情 {} 款、标签 {} 款、存储回填 {} 款（非官方接口，限速 20 次/分）",
-                need_details.len(),
-                need_tags.len(),
-                need_storage.len()
-            ));
-            let store_client = SteamStore::new(proxy.clone())?;
-            // 间歇性风控（429/403）下的失败先收集，循环结束后统一补试一轮——
-            // 不在主循环里 ERROR 刷屏（浏览器打开同一链接正常，就是间歇性的证据）
-            let mut failed_details: Vec<u32> = Vec::new();
-            let mut failed_tags: Vec<u32> = Vec::new();
-            for (i, app_id) in need_details.iter().enumerate() {
-                if interrupted || cancel.is_cancelled() {
-                    interrupted = true;
-                    break;
+        let store_client = Arc::new(SteamStore::new(proxy.clone())?);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Fetched>(64);
+        // 并发上限只用来藏 RTT；实际速率由客户端里的限流器约束，不会加重风控压力
+        let web_sem = Arc::new(tokio::sync::Semaphore::new(6));
+        let api_sem = Arc::new(tokio::sync::Semaphore::new(3));
+        let page_sem = Arc::new(tokio::sync::Semaphore::new(3));
+
+        for (app_id, name) in &todo {
+            let (client, steamid, tx, sem, cancel) =
+                (client.clone(), steamid.clone(), tx.clone(), web_sem.clone(), cancel.clone());
+            let (app_id, name) = (*app_id, name.clone());
+            tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                if cancel.is_cancelled() {
+                    return;
                 }
-                match store_client.get_app_details(*app_id).await {
-                    Ok(Some(d)) => {
-                        store.upsert_app_detail(*app_id, &d)?;
-                    }
-                    Ok(None) => {
-                        // success=false（商店已下架等）：记 unknown，避免每次同步重试
-                        store.upsert_app_detail(
-                            *app_id,
-                            &AppDetail { app_type: "unknown".into(), genres: vec![], categories: vec![], storage_gb: None },
-                        )?;
-                    }
-                    Err(e) => {
-                        tracing::warn!("app {app_id} 商店详情拉取失败（稍后重试）: {e}");
-                        failed_details.push(*app_id);
-                    }
+                let res = client.get_player_achievements(&steamid, app_id).await;
+                if cancel.is_cancelled() {
+                    return;
                 }
-                if (i + 1) % 10 == 0 {
-                    progress(&format!("  … 详情 {}/{}", i + 1, need_details.len()));
+                let _ = tx.send(Fetched::PlayerAch { app_id, name, res }).await;
+            });
+        }
+        for app_id in &need_global {
+            let (client, tx, sem, cancel, app_id) =
+                (client.clone(), tx.clone(), web_sem.clone(), cancel.clone(), *app_id);
+            tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                if cancel.is_cancelled() {
+                    return;
                 }
+                let res = client.get_global_achievement_percentages(app_id).await;
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let _ = tx.send(Fetched::Global { app_id, res }).await;
+            });
+        }
+        for app_id in &need_details {
+            let (store_client, tx, sem, cancel, app_id) =
+                (store_client.clone(), tx.clone(), api_sem.clone(), cancel.clone(), *app_id);
+            tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let res = store_client.get_app_details(app_id).await;
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let _ = tx.send(Fetched::Detail { app_id, res }).await;
+            });
+        }
+        let spawn_page = |app_id: u32,
+                          tx: tokio::sync::mpsc::Sender<Fetched>,
+                          sem: Arc<tokio::sync::Semaphore>,
+                          cancel: CancellationToken,
+                          store_client: Arc<SteamStore>,
+                          is_tag: bool| {
+            tokio::spawn(async move {
+                let _permit = sem.acquire_owned().await;
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let res = store_client.get_store_page_info(app_id).await;
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let _ = tx
+                    .send(if is_tag { Fetched::Tags { app_id, res } } else { Fetched::Storage { app_id, res } })
+                    .await;
+            });
+        };
+        for app_id in &need_tags {
+            spawn_page(*app_id, tx.clone(), page_sem.clone(), cancel.clone(), store_client.clone(), true);
+        }
+        for app_id in &need_storage {
+            spawn_page(*app_id, tx.clone(), page_sem.clone(), cancel.clone(), store_client.clone(), false);
+        }
+        drop(tx); // 生成者全数收尾后 recv 返回 None，消费者自然退出
+
+        // 消费者（主循环）：唯一的 DB 写入方
+        let mut c_failed = 0usize;
+        let mut d_failed: Vec<u32> = Vec::new();
+        let mut t_failed: Vec<u32> = Vec::new();
+        let (mut c_done, mut d_done, mut t_done, mut s_done) = (0usize, 0usize, 0usize, 0usize);
+        let mut processed = 0usize;
+        while let Some(item) = rx.recv().await {
+            if cancel.is_cancelled() {
+                interrupted = true;
+                break;
             }
-            for (i, app_id) in need_tags.iter().enumerate() {
-                if interrupted || cancel.is_cancelled() {
-                    interrupted = true;
-                    break;
-                }
-                match store_client.get_store_page_info(*app_id).await {
-                    Ok(Some((tags, storage_gb))) => {
-                        store.upsert_store_tags(*app_id, &tags)?;
-                        // 同页面顺带回填存储需求（零额外请求）
-                        if storage_gb.is_some() {
-                            if let Some(mut d) = store.app_detail(*app_id)? {
-                                d.storage_gb = storage_gb;
-                                store.upsert_app_detail(*app_id, &d)?;
-                            }
+            processed += 1;
+            match item {
+                Fetched::PlayerAch { app_id, name, res } => {
+                    b_done += 1;
+                    match res {
+                        Ok(Some(achs)) => store.upsert_achievements(app_id, &achs)?,
+                        Ok(None) => store.mark_skipped(app_id, "无成就或不可用")?,
+                        Err(e) => {
+                            b_failed += 1;
+                            tracing::error!("{name}：{e}");
                         }
                     }
-                    Ok(None) => {
-                        // 年龄门未过/下架：存空列表作"已处理"标记，品味键自动退回 genres
-                        store.upsert_store_tags(*app_id, &[])?;
-                    }
-                    Err(e) => {
-                        tracing::warn!("app {app_id} 用户标签拉取失败（稍后重试）: {e}");
-                        failed_tags.push(*app_id);
+                }
+                Fetched::Global { app_id, res } => {
+                    c_done += 1;
+                    match res {
+                        Ok(Some(rows)) => store.upsert_global_achievements(app_id, &rows)?,
+                        Ok(None) => store.mark_skipped(app_id, "无成就（global）")?,
+                        Err(e) => {
+                            c_failed += 1;
+                            tracing::error!("app {app_id} 全球完成度拉取失败: {e}");
+                        }
                     }
                 }
-                if (i + 1) % 10 == 0 {
-                    progress(&format!("  … 标签 {}/{}", i + 1, need_tags.len()));
+                Fetched::Detail { app_id, res } => {
+                    d_done += 1;
+                    match res {
+                        Ok(Some(d)) => store.upsert_app_detail(app_id, &d)?,
+                        // success=false（商店已下架等）：记 unknown，避免每次同步重试
+                        Ok(None) => store.upsert_app_detail(
+                            app_id,
+                            &AppDetail { app_type: "unknown".into(), genres: vec![], categories: vec![], storage_gb: None },
+                        )?,
+                        Err(e) => {
+                            tracing::warn!("app {app_id} 商店详情拉取失败（稍后重试）: {e}");
+                            d_failed.push(app_id);
+                        }
+                    }
+                }
+                Fetched::Tags { app_id, res } => {
+                    t_done += 1;
+                    match res {
+                        Ok(Some((tags, storage_gb))) => {
+                            store.upsert_store_tags(app_id, &tags)?;
+                            // 同页面顺带回填存储需求（零额外请求）
+                            if storage_gb.is_some() {
+                                if let Some(mut d) = store.app_detail(app_id)? {
+                                    d.storage_gb = storage_gb;
+                                    store.upsert_app_detail(app_id, &d)?;
+                                }
+                            }
+                        }
+                        // 年龄门未过/下架：存空列表作"已处理"标记，品味键自动退回 genres
+                        Ok(None) => store.upsert_store_tags(app_id, &[])?,
+                        Err(e) => {
+                            tracing::warn!("app {app_id} 用户标签拉取失败（稍后重试）: {e}");
+                            t_failed.push(app_id);
+                        }
+                    }
+                }
+                Fetched::Storage { app_id, res } => {
+                    s_done += 1;
+                    // 年龄门/网络失败下次再试；Ok(None) 无存储信息可写
+                    if let Ok(Some((_, Some(gb)))) = res {
+                        if let Some(mut d) = store.app_detail(app_id)? {
+                            d.storage_gb = Some(gb);
+                            store.upsert_app_detail(app_id, &d)?;
+                        }
+                    }
                 }
             }
-            // 风控失败补试：此时限流窗口已过去，多数间歇性失败能一次补齐
-            if !failed_details.is_empty() || !failed_tags.is_empty() {
+            if processed % 20 == 0 {
                 progress(&format!(
-                    "  … {} 款详情 / {} 款标签失败，30 秒后补试一轮",
-                    failed_details.len(),
-                    failed_tags.len()
+                    "  … 成就 {}/{} · 全球 {}/{} · 详情 {}/{} · 标签 {}/{} · 回填 {}/{}",
+                    b_done,
+                    todo.len(),
+                    c_done,
+                    need_global.len(),
+                    d_done,
+                    need_details.len(),
+                    t_done,
+                    need_tags.len(),
+                    s_done,
+                    need_storage.len()
                 ));
-                for _ in 0..30 {
-                    if interrupted || cancel.is_cancelled() {
-                        interrupted = true;
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        progress(&format!(
+            "      并行阶段完成：成就 {} 款（失败 {}）· 全球 {}（失败 {}）· 详情 {}（失败 {}）· 标签 {}（失败 {}）· 回填 {}，用时 {:.1}s",
+            todo.len() - b_failed,
+            b_failed,
+            need_global.len() - c_failed,
+            c_failed,
+            need_details.len() - d_failed.len(),
+            d_failed.len(),
+            need_tags.len() - t_failed.len(),
+            t_failed.len(),
+            s_done,
+            t0.elapsed().as_secs_f32()
+        ));
+
+        // 间歇性风控（429/403）补试：此时限流窗口已过去，串行小批量即可
+        if !interrupted && !cancel.is_cancelled() && (!d_failed.is_empty() || !t_failed.is_empty()) {
+            progress(&format!(
+                "  … {} 款详情 / {} 款标签失败，30 秒后补试一轮",
+                d_failed.len(),
+                t_failed.len()
+            ));
+            for _ in 0..30 {
+                if cancel.is_cancelled() {
+                    interrupted = true;
+                    break;
                 }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
             if !interrupted && !cancel.is_cancelled() {
-                let mut still_details = 0usize;
-                for app_id in &failed_details {
+                let mut still = 0usize;
+                for app_id in &d_failed {
                     match store_client.get_app_details(*app_id).await {
                         Ok(Some(d)) => {
                             store.upsert_app_detail(*app_id, &d)?;
@@ -233,11 +351,10 @@ pub async fn run(
                                 &AppDetail { app_type: "unknown".into(), genres: vec![], categories: vec![], storage_gb: None },
                             )?;
                         }
-                        Err(_) => still_details += 1,
+                        Err(_) => still += 1,
                     }
                 }
-                let mut still_tags = 0usize;
-                for app_id in &failed_tags {
+                for app_id in &t_failed {
                     match store_client.get_store_page_info(*app_id).await {
                         Ok(Some((tags, storage_gb))) => {
                             store.upsert_store_tags(*app_id, &tags)?;
@@ -251,39 +368,12 @@ pub async fn run(
                         Ok(None) => {
                             store.upsert_store_tags(*app_id, &[])?;
                         }
-                        Err(_) => still_tags += 1,
+                        Err(_) => still += 1,
                     }
                 }
-                if still_details > 0 || still_tags > 0 {
-                    tracing::error!(
-                        "商店数据仍有 {} 款详情 / {} 款标签未拉到——多为暂时性风控，下次同步会自动重试",
-                        still_details, still_tags
-                    );
-                    progress(&format!(
-                        "  … 商店数据仍有 {} 款未拉到（下次同步自动重试）",
-                        still_details + still_tags
-                    ));
-                }
-            }
-            // 存储需求回填：已有标签但缺 storage_gb 的游戏，重抓商店页补填
-            for (i, app_id) in need_storage.iter().enumerate() {
-                if interrupted || cancel.is_cancelled() {
-                    interrupted = true;
-                    break;
-                }
-                match store_client.get_store_page_info(*app_id).await {
-                    Ok(Some((_, storage_gb))) => {
-                        if let Some(gb) = storage_gb {
-                            if let Some(mut d) = store.app_detail(*app_id)? {
-                                d.storage_gb = Some(gb);
-                                store.upsert_app_detail(*app_id, &d)?;
-                            }
-                        }
-                    }
-                    _ => {} // 年龄门/网络失败：下次再试
-                }
-                if (i + 1) % 10 == 0 {
-                    progress(&format!("  … 存储回填 {}/{}", i + 1, need_storage.len()));
+                if still > 0 {
+                    tracing::error!("商店数据仍有 {still} 款未拉到——多为暂时性风控，下次同步会自动重试");
+                    progress(&format!("  … 商店数据仍有 {still} 款未拉到（下次同步自动重试）"));
                 }
             }
         }
@@ -362,12 +452,12 @@ pub async fn run(
     }
 
     if interrupted {
-        progress(&format!("已中断：Tier B 完成 {}/{}（已拉取部分均已入库）", done, todo.len()));
+        progress(&format!("已中断：成就 {}/{}（已拉取部分均已入库）", b_done, todo.len()));
     } else {
         progress(&format!(
             "同步完成：成就 {} 款、失败 {} 款，用时 {:.1}s；数据库 {}",
-            todo.len() - failed,
-            failed,
+            todo.len() - b_failed,
+            b_failed,
             t0.elapsed().as_secs_f32(),
             db.display()
         ));

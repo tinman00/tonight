@@ -94,6 +94,14 @@ fn normalize_proxy(p: &str) -> String {
 
 type Limiter = RateLimiter<NotKeyed, InMemoryState, QuantaClock, NoOpMiddleware<QuantaInstant>>;
 
+/// 稳态限流配额：均值 N/分钟、突发压到 burst——per_minute 整桶突发（容量=分钟配额）
+/// 会瞬间打满代理出口触发风控，压小突发才是贴近均值的匀速
+fn steady_per_minute(per_min: NonZeroU32, burst: NonZeroU32) -> Quota {
+    Quota::per_minute(per_min).allow_burst(burst)
+}
+
+/// Web API 客户端：Clone 廉价（reqwest 内部 Arc + 限流器共享），并行取数时按任务克隆
+#[derive(Clone)]
 pub struct SteamClient {
     http: reqwest::Client,
     api_key: Option<String>,
@@ -345,11 +353,14 @@ impl SteamClient {
 
 const STORE_BASE: &str = "https://store.steampowered.com";
 
-/// Steam 商店接口（Tier D，非官方端点）：限流远严于 Web API（约 200 次/5 分钟、单 appid），
-/// 独立低速率限流器，仅首次同步拉取、长期缓存。
+/// Steam 商店接口（Tier D，非官方端点）：限流远严于 Web API（约 200 次/5 分钟），长期缓存。
+/// v0.47 起双通道独立限速：/api/* 接口与商店页 HTML 分开——页面是 CDN 静态页、容忍度更高
+/// （1/s 稳态），appdetails 走 36/min（200/5min 社区口径留余量、突发压小）；
+/// 两条通道并行取数，首次同步墙钟时间由"串行 2N 次/20 每分"降为 max(N/36, N/60) 分钟。
 pub struct SteamStore {
     http: reqwest::Client,
-    limiter: Arc<Limiter>,
+    api_limiter: Arc<Limiter>,
+    page_limiter: Arc<Limiter>,
 }
 
 impl SteamStore {
@@ -366,9 +377,13 @@ impl SteamStore {
             http: builder
                 .build()
                 .map_err(|e| SteamError::Network(redact(&e.to_string())))?,
-            limiter: Arc::new(RateLimiter::direct(Quota::per_minute(
-                // 200 次/5 分钟 = 均值 40/min；30/min 已贴近上限，代理出口下突发即触发风控
-                NonZeroU32::new(20).expect("非零"),
+            api_limiter: Arc::new(RateLimiter::direct(steady_per_minute(
+                NonZeroU32::new(36).expect("非零"),
+                NonZeroU32::new(5).expect("非零"),
+            ))),
+            page_limiter: Arc::new(RateLimiter::direct(steady_per_minute(
+                NonZeroU32::new(60).expect("非零"),
+                NonZeroU32::new(2).expect("非零"),
             ))),
         })
     }
@@ -376,10 +391,15 @@ impl SteamStore {
     /// 统一的商店 GET：限流 + 重试。429/403/5xx 与网络错误（超时/连接重置）都按指数退避
     /// 重试——Steam 风控对代理出口常见**间歇性** 403/429，这正是"app 报错、浏览器打开
     /// 同一链接却正常"的原因（两者出口与端点都不同）；单次失败即报错只会刷屏。
-    async fn get_with_retry(&self, url: &str, cookie: Option<&str>) -> Result<String, SteamError> {
+    async fn get_with_retry(
+        &self,
+        url: &str,
+        cookie: Option<&str>,
+        limiter: &Limiter,
+    ) -> Result<String, SteamError> {
         let mut attempt = 0u32;
         loop {
-            self.limiter.until_ready().await;
+            limiter.until_ready().await;
             let req = self.http.get(url);
             let req = match cookie {
                 Some(c) => req.header("Cookie", c),
@@ -421,12 +441,17 @@ impl SteamStore {
     }
 
     /// 单应用详情（type / genres / categories，中文本地化）。success=false 返回 None。
+    /// filters 裁字段：默认全量响应 ~27KB/款，只要 basic+genres+categories 压到 ~2.5KB
+    /// （多 appid 批量仅对 filters=price_overview 有效——官方 wiki 明说其余批量返回 null，
+    /// 实测 400，故详情仍是每款一请求）
     pub async fn get_app_details(
         &self,
         app_id: u32,
     ) -> Result<Option<crate::models::AppDetail>, SteamError> {
-        let url = format!("{STORE_BASE}/api/appdetails?appids={app_id}&l=schinese");
-        let text = self.get_with_retry(&url, None).await?;
+        let url = format!(
+            "{STORE_BASE}/api/appdetails?appids={app_id}&l=schinese&filters=basic,genres,categories"
+        );
+        let text = self.get_with_retry(&url, None, &self.api_limiter).await?;
                 #[derive(Deserialize)]
                 struct Entry {
                     success: bool,
@@ -501,7 +526,11 @@ impl SteamStore {
     ) -> Result<Option<(Vec<String>, Option<f64>)>, SteamError> {
         let url = format!("{STORE_BASE}/app/{app_id}/?l=schinese");
         let html = self
-            .get_with_retry(&url, Some("birthtime=315532800; lastagecheckage=252460800"))
+            .get_with_retry(
+                &url,
+                Some("birthtime=315532800; lastagecheckage=252460800"),
+                &self.page_limiter,
+            )
             .await?;
         let tags = extract_store_tags(&html);
         let storage_gb = extract_storage_gb(&html);

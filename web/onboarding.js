@@ -203,7 +203,7 @@
     b.innerHTML = card(`
       ${dots()}
       <h2>抓取你的 Steam 游戏库</h2>
-      <p>最后一步：抓取游戏库并生成玩家画像（首次约 2–5 分钟，之后增量秒级）。</p>
+      <p>最后一步：抓取游戏库并生成玩家画像（首次视库大小约 3–15 分钟，进度里会给出更准的预估；之后增量秒级）。</p>
       <p class="ob-warn">⚠ 需要你的 Steam 资料对公众可见：Steam 个人资料 → 隐私设置，
          把「我的资料」与「游戏详情」都设为「公开」，否则 Steam API 会拒绝查询（403）。</p>
       <div class="field"><label>SteamID64${local ? `（检测到本机账号：${esc(local.persona_name || local.steamid)}）` : "（留空自动检测本机登录的 Steam）"}</label>

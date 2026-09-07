@@ -910,6 +910,9 @@ struct OverrideReq {
     /// game: "force"（空=清除）；depth: 档位中文或空/auto（清除）
     #[serde(default)]
     value: String,
+    /// 批量版（v0.46）：异常清单「全部已玩完」一键标注；给了 app_ids 时忽略 app_id
+    #[serde(default)]
+    app_ids: Vec<u32>,
 }
 
 async fn api_override(State(app): State<Shared>, Json(req): Json<OverrideReq>) -> impl IntoResponse {
@@ -930,6 +933,17 @@ async fn api_override(State(app): State<Shared>, Json(req): Json<OverrideReq>) -
     };
     if !ok {
         return err_json(format!("kind/value 不合法：{} / {}", req.kind, req.value));
+    }
+    // 批量（app_ids）优先；两条路径共用同一套 kind/value 校验
+    if !req.app_ids.is_empty() {
+        let mut done = 0usize;
+        for id in &req.app_ids {
+            match store.set_override(*id, &req.kind, v) {
+                Ok(_) => done += 1,
+                Err(e) => return err_json(format!("第 {done} 款（app {id}）失败：{e}")),
+            }
+        }
+        return Json(json!({"ok": true, "count": done}));
     }
     match store.set_override(req.app_id, &req.kind, v) {
         Ok(_) => Json(json!({"ok": true})),

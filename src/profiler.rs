@@ -34,14 +34,14 @@ pub fn is_expressive(name: &str) -> bool {
 }
 
 /// 成就分类规则版本：升级提示词/输入信号时递增，sync 检测到旧版缓存会清空并在线重分析
-pub const ACH_CAT_VERSION: &str = "2";
+pub const ACH_CAT_VERSION: &str = "3";
 
 const TYPE_SYSTEM: &str = "你是 Steam 成就分类器。输入为成就内部标识名（api_name）与其全球达成率，把每个成就分到恰好一个类别：\n\
 story=剧情/关卡推进（完成任务目标、到达剧情节点，**含终章之前的推进**）；challenge=高难度挑战（无伤/速通/高难操作/完成一项考验/生存试炼）；\n\
 collect=收集齐 N 个物品/图鉴；explore=探索发现（地图/隐藏区域/秘密）；competitive=多人对战/排名/竞技；\n\
-coop=多人合作相关；grind=长期重复劳动或累计数量；other=无法判断。\n\
+coop=多人合作相关（合作/双人模式的推进与目标都算——合作战役的章节推进也是 coop，即便带剧情色彩也不是 story）；grind=长期重复劳动或累计数量；other=无法判断。\n\
 completion=**游戏主线战役的最终终点**——击败最终 Boss、到达结局、通关制作人员名单。只有\"游戏走到头\"的标志才归此类：\n\
-终章高潮（最终决战、逃离设施、通关字幕）算；章节中途推进、支线/可选结局、生存或试炼类条件达成、完成若干挑战**都不是**。\n\
+终章高潮（最终决战、逃离设施、通关字幕，含终幕标志性动作，如\"射向月亮\"式结局事件）算；章节中途推进、支线/可选结局、生存或试炼类条件达成、完成若干挑战**都不是**。\n\
 completion 误判的代价很高（游戏会被直接标记为已完成）：拿不准就不给，story 是安全落点。\n\
 全球达成率仅供参考：前期/教程成就普遍 >60%，主线终点多在 15–50%，彩蛋与极限挑战 <10%。\n\
 输出严格的 JSON 对象 {\"<api_name>\":\"<类别小写>\"}，必须覆盖输入的每一个名字，不要输出任何其他文字。";
@@ -490,6 +490,9 @@ pub struct PlayerProfile {
 ///   门槛校准：20h 时传送门2（6.5h 通关单机、合作成就没做、结局成就未被 LLM 分到 completion 类）
 ///   够不着；降到 6h 后全库候选 ~7 项（含 Hades 等真弃坑），由「没玩完」一键忽略，
 ///   忽略标记（anomaly_done）持久化、不再打扰。
+///   v0.46 扩到「暂离」档：叙事类游戏（通关但成就覆盖不足的漏网形态）自动判完成
+///   失败时落暂离而非弃坑，旧条件对它们永远沉默——只能逐个翻深度角标手动标注。
+///   现在"弃坑/暂离"两档都提示，配合异常清单的「全部已玩完」一键批量标注。
 /// 已有手动深度标注的游戏视为已处理，不再提示。
 pub fn detect_anomalies(store: &Store, cfg: &Config) -> Result<Vec<(u32, String, String, String)>> {
     let profile = compute(store, cfg)?;
@@ -552,7 +555,11 @@ pub fn detect_anomalies(store: &Store, cfg: &Config) -> Result<Vec<(u32, String,
             .last_played
             .map(|t| (now.saturating_sub(t)) / 86_400)
             .unwrap_or(u64::MAX);
-        if g.depth == GameDepth::Abandoned && g.playtime_min >= 360 && days_since >= 90 {
+        // 弃坑/暂离两档都提示（v0.46）：长线/叙事类的"暂离"里藏着通关但成就信号不足的漏网形态
+        if matches!(g.depth, GameDepth::Abandoned | GameDepth::Service)
+            && g.playtime_min >= 360
+            && days_since >= 90
+        {
             out.push((
                 g.app_id,
                 g.name.clone(),
@@ -731,35 +738,52 @@ pub fn compute(store: &Store, cfg: &Config) -> Result<PlayerProfile> {
         }
 
         // 深度分层（design §7.4）。
-        // 已通关两条路径：
+        // 已通关三条路径：
         //   a) 完成度 ≥80%——仅当成就总数 ≥10 才可信（防 CS2 这类单成就游戏的 100% 误导）；
         //   b) 里程碑通关（C4 复用，"LLM 判类型、代码算分数"）：玩家获得「通关标记类成就
         //      且其全球完成度 ≤ 阈值」即视为触及游戏终点——空洞骑士如一结局、泰拉瑞亚击败
         //      月主这类节点由成就类型分类识别；完成度百分比低（大量可选成就）不再误判弃坑。
         //      注意：通关节点成就在全球通常 20–35% 完成度（最稀有的是彩蛋/全成就挑战，
         //      不能用"最稀有"口径）。
+        //   c) 剧情覆盖率（v0.46，非成就党通关路径）：拿到 ≥story_finish_rate 的剧情/通关类
+        //      成就即视为完成主线（合作/竞技不计入分母）。真机案例：传送门2 通关局总完成度
+        //      仅 35%、结局成就 SHOOT_THE_MOON 被分到 story 且全库无 completion 项——
+        //      a/b 两条路径整体失效；但通关者必然拿到几乎全部主线推进成就，覆盖率能兜住。
+        //      成就数 <10 项时信号弱（缺一两条即大幅失真），要求全拿。
         let days_since = g.last_played.map(|t| (now.saturating_sub(t)) / 86_400).unwrap_or(u64::MAX);
         let total_ach = achievements.len() as u32;
         let completion_credible = total_ach >= 10;
+        let cat_vec = store.achievement_categories(g.app_id)?;
+        let cats: HashMap<&str, AchievementCategory> =
+            cat_vec.iter().map(|(n, c)| (n.as_str(), *c)).collect();
+        let global_vec = store.global_achievements(g.app_id)?;
+        let globals: HashMap<&str, f32> =
+            global_vec.iter().map(|(n, p)| (n.as_str(), *p)).collect();
         // 里程碑判定加 2 小时门槛：雨世界真机误判——110 分钟达成"生存通行证"（completion 类、
         // 全球 23.5% ≤ 阈值）被判"已完成"，但那只是早期成就不是终点；2 小时以下不可能"完成"一款游戏
-        let milestone_finished = if g.playtime_min >= 120 && total_ach > 0 && !achieved.is_empty() {
-            let cat_vec = store.achievement_categories(g.app_id)?;
-            let cats: HashMap<&str, AchievementCategory> =
-                cat_vec.iter().map(|(n, c)| (n.as_str(), *c)).collect();
-            let global_vec = store.global_achievements(g.app_id)?;
-            let globals: HashMap<&str, f32> =
-                global_vec.iter().map(|(n, p)| (n.as_str(), *p)).collect();
-            achieved.iter().any(|a| {
+        let milestone_finished = g.playtime_min >= 120 && !achieved.is_empty()
+            && achieved.iter().any(|a| {
                 cats.get(a).copied() == Some(AchievementCategory::CompletionMark)
                     && globals
                         .get(a)
                         .map(|p| *p <= cfg.profile.finished_mark_max_pct as f32)
                         .unwrap_or(false)
-            })
+            });
+        let story_class =
+            |c: &AchievementCategory| matches!(c, AchievementCategory::Story | AchievementCategory::CompletionMark);
+        let story_total = cats.values().filter(|c| story_class(c)).count();
+        let story_got = achieved
+            .iter()
+            .filter(|a| cats.get(*a).is_some_and(|c| story_class(c)))
+            .count();
+        let story_need = if story_total >= 10 {
+            cfg.profile.story_finish_rate as f32
         } else {
-            false
+            1.0
         };
+        let story_finished = g.playtime_min >= 120
+            && story_total >= 5
+            && story_got as f32 >= story_need * story_total as f32;
         let depth = if g.playtime_min == 0 {
             GameDepth::Unplayed
         } else if milestone_finished
@@ -767,7 +791,10 @@ pub fn compute(store: &Store, cfg: &Config) -> Result<PlayerProfile> {
         {
             GameDepth::Finished
         } else if days_since <= 30 {
+            // 活跃期先于覆盖率路径：还在玩的不急着判完成，停了才转"已完成"
             GameDepth::Active
+        } else if story_finished {
+            GameDepth::Finished
         } else if is_narrative_game(&tags)
             || (g.playtime_min >= 120 && is_service_game(&tags))
         {
@@ -1218,6 +1245,40 @@ mod tests {
     }
 
     #[test]
+    fn suspect_finished_also_flags_idle_service_games() {
+        // v0.46：暂离档也进疑似完成——通关但成就覆盖不足的叙事类漏网形态落"暂离"而非"弃坑"，
+        // 旧条件（只查弃坑档）对它们永远沉默，用户只能逐个翻深度角标手动标注
+        let store = Store::open_in_memory().unwrap();
+        let now = now_secs();
+        store
+            .upsert_owned_games(&[crate::models::OwnedGame {
+                app_id: 730,
+                name: "CS2".into(),
+                playtime_min: 2_000,
+                playtime_2weeks_min: 0,
+                last_played: Some(now - 200 * 86_400),
+            }])
+            .unwrap();
+        store.upsert_app_detail(730, &detail_of("game")).unwrap();
+        store.upsert_store_tags(730, &tags(&["免费开玩", "多人", "竞技", "射击"])).unwrap();
+        // 有成就但完成度 0（未通关证据），避免落入 no_ach
+        store
+            .upsert_achievements(
+                730,
+                &[crate::models::Achievement { api_name: "A".into(), achieved: false, unlock_time: None }],
+            )
+            .unwrap();
+        let p = compute(&store, &Config::default()).unwrap();
+        let g = p.games.iter().find(|g| g.app_id == 730).unwrap();
+        assert_eq!(g.depth, GameDepth::Service, "长线类 2000 分钟 → 暂离档");
+        let anomalies = detect_anomalies(&store, &Config::default()).unwrap();
+        assert!(
+            anomalies.iter().any(|(id, _, k, _)| *id == 730 && k == "suspect_finished"),
+            "暂离档 + ≥6h + ≥90 天没玩 → 也应进疑似完成提示"
+        );
+    }
+
+    #[test]
     fn no_ach_detects_global_known_games_even_if_skipped() {
         // 传送门2 类：成就拉取失败被标 skip（Steam 返回"不可用"），但全球完成度表有数据
         // （游戏确有成就系统）→ 仍应提示 no_ach（旧条件 !skipped 会漏掉）
@@ -1276,5 +1337,146 @@ mod tests {
         let p = compute(&store, &Config::default()).unwrap();
         let g = p.games.iter().find(|g| g.app_id == 312520).unwrap();
         assert_eq!(g.depth, GameDepth::Sampled, "110min 不应判已完成");
+    }
+
+    /// 构造"剧情类 N 拿 M + 干扰类别"的成就夹具：返回 (成就列表, 分类列表)
+    fn story_fixture(
+        story_got: usize,
+        story_miss: usize,
+        challenge: usize,
+        coop: usize,
+    ) -> (Vec<crate::models::Achievement>, Vec<(String, AchievementCategory)>) {
+        let mut achs = Vec::new();
+        let mut cats = Vec::new();
+        let mut push = |achs: &mut Vec<_>, cats: &mut Vec<_>, name: String, got: bool, c: AchievementCategory| {
+            achs.push(crate::models::Achievement {
+                api_name: name.clone(),
+                achieved: got,
+                unlock_time: None,
+            });
+            cats.push((name, c));
+        };
+        for i in 0..story_got {
+            push(&mut achs, &mut cats, format!("STORY_GOT_{i}"), true, AchievementCategory::Story);
+        }
+        for i in 0..story_miss {
+            push(&mut achs, &mut cats, format!("STORY_MISS_{i}"), false, AchievementCategory::Story);
+        }
+        for i in 0..challenge {
+            push(&mut achs, &mut cats, format!("CHAL_{i}"), false, AchievementCategory::Challenge);
+        }
+        for i in 0..coop {
+            push(&mut achs, &mut cats, format!("COOP_{i}"), false, AchievementCategory::Coop);
+        }
+        (achs, cats)
+    }
+
+    #[test]
+    fn story_coverage_finishes_portal2_like_games() {
+        // 传送门2 真机形状（v3 重分类后）：20 项 story 拿 17（85%）、4 项合作全没拿、
+        // 27 项挑战全没拿——总完成度仅 33% 且全库无 completion 项，a/b 两条老路径都失效，
+        // 剧情覆盖率路径兜住（合作/竞技不计入分母，没拿不影响）
+        let store = Store::open_in_memory().unwrap();
+        let now = now_secs();
+        store
+            .upsert_owned_games(&[crate::models::OwnedGame {
+                app_id: 620,
+                name: "Portal 2".into(),
+                playtime_min: 390,
+                playtime_2weeks_min: 0,
+                last_played: Some(now - 600 * 86_400),
+            }])
+            .unwrap();
+        store.upsert_app_detail(620, &detail_of("game")).unwrap();
+        let (achs, cats) = story_fixture(17, 3, 27, 4);
+        store.upsert_achievements(620, &achs).unwrap();
+        store.upsert_achievement_categories(620, &cats).unwrap();
+        let p = compute(&store, &Config::default()).unwrap();
+        let g = p.games.iter().find(|g| g.app_id == 620).unwrap();
+        assert_eq!(g.depth, GameDepth::Finished, "剧情类 85% 覆盖 + 停玩 600 天 → 已完成");
+    }
+
+    #[test]
+    fn story_coverage_blocked_while_active_and_small_sets() {
+        // ① 85% 覆盖但 30 天内还在玩 → 活跃中（活跃期先于覆盖率路径，停了才转已完成）
+        let store = Store::open_in_memory().unwrap();
+        let now = now_secs();
+        store
+            .upsert_owned_games(&[crate::models::OwnedGame {
+                app_id: 1,
+                name: "Active".into(),
+                playtime_min: 3_000,
+                playtime_2weeks_min: 90,
+                last_played: Some(now - 5 * 86_400),
+            }])
+            .unwrap();
+        store.upsert_app_detail(1, &detail_of("game")).unwrap();
+        let (achs, cats) = story_fixture(17, 3, 5, 2);
+        store.upsert_achievements(1, &achs).unwrap();
+        store.upsert_achievement_categories(1, &cats).unwrap();
+        let p = compute(&store, &Config::default()).unwrap();
+        let g = p.games.iter().find(|g| g.app_id == 1).unwrap();
+        assert_eq!(g.depth, GameDepth::Active, "还在玩的不急着判完成");
+
+        // ② story 类 <10 项：信号弱，要求全拿。TUNIC 形状（5/6=83%）不判完成
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_owned_games(&[crate::models::OwnedGame {
+                app_id: 2,
+                name: "TUNIC".into(),
+                playtime_min: 695,
+                playtime_2weeks_min: 0,
+                last_played: Some(now - 300 * 86_400),
+            }])
+            .unwrap();
+        store.upsert_app_detail(2, &detail_of("game")).unwrap();
+        let (achs, cats) = story_fixture(5, 1, 3, 0);
+        store.upsert_achievements(2, &achs).unwrap();
+        store.upsert_achievement_categories(2, &cats).unwrap();
+        let p = compute(&store, &Config::default()).unwrap();
+        let g = p.games.iter().find(|g| g.app_id == 2).unwrap();
+        assert_eq!(g.depth, GameDepth::Abandoned, "5/6 story（小成就集）不足以判完成");
+
+        // ③ 小成就集全拿（6/6）→ 已完成（upsert 按 api_name 合并不清除旧行，换独立库验证）
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_owned_games(&[crate::models::OwnedGame {
+                app_id: 2,
+                name: "TUNIC".into(),
+                playtime_min: 695,
+                playtime_2weeks_min: 0,
+                last_played: Some(now - 300 * 86_400),
+            }])
+            .unwrap();
+        store.upsert_app_detail(2, &detail_of("game")).unwrap();
+        let (achs, cats) = story_fixture(6, 0, 3, 0);
+        store.upsert_achievements(2, &achs).unwrap();
+        store.upsert_achievement_categories(2, &cats).unwrap();
+        let p = compute(&store, &Config::default()).unwrap();
+        let g = p.games.iter().find(|g| g.app_id == 2).unwrap();
+        assert_eq!(g.depth, GameDepth::Finished, "小成就集全拿 → 已完成");
+    }
+
+    #[test]
+    fn story_coverage_partial_progress_does_not_finish() {
+        // 中途弃坑形状：20 项 story 拿 12（60% < 80%）、挑战全没拿——覆盖不了，仍判弃坑
+        let store = Store::open_in_memory().unwrap();
+        let now = now_secs();
+        store
+            .upsert_owned_games(&[crate::models::OwnedGame {
+                app_id: 5,
+                name: "MidDrop".into(),
+                playtime_min: 1_800,
+                playtime_2weeks_min: 0,
+                last_played: Some(now - 200 * 86_400),
+            }])
+            .unwrap();
+        store.upsert_app_detail(5, &detail_of("game")).unwrap();
+        let (achs, cats) = story_fixture(12, 8, 30, 2);
+        store.upsert_achievements(5, &achs).unwrap();
+        store.upsert_achievement_categories(5, &cats).unwrap();
+        let p = compute(&store, &Config::default()).unwrap();
+        let g = p.games.iter().find(|g| g.app_id == 5).unwrap();
+        assert_eq!(g.depth, GameDepth::Abandoned, "剧情类 60% 覆盖是玩到中途，不是通关");
     }
 }

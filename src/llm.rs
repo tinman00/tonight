@@ -111,6 +111,107 @@ pub enum LlmError {
     EmptyContent,
 }
 
+/// 敏感信息脱敏（错误信息/日志共用，v0.48）：掩码四类形态——
+/// ① URL 查询串（部分用户把 key 拼在 base_url 的 `?` 之后，reqwest 错误会带完整 URL）；
+/// ② `Bearer <token>`；③ `sk-` 前缀凭证；④ `key=<长凭证>`（Steam 风格）。
+/// 只在 ASCII 边界切分，中文正文不受影响。
+pub fn redact(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        // ① URL 查询串：当前"词"（自上一个空白起）已含 ://，且此处是 ?
+        if b[i] == b'?' {
+            let word_start = out.rfind(char::is_whitespace).map(|p| p + 1).unwrap_or(0);
+            if out[word_start..].contains("://") {
+                let mut j = i + 1;
+                while j < b.len()
+                    && !matches!(b[j], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b')')
+                    && (b[j] as char) != '）'
+                {
+                    j += 1;
+                }
+                out.push_str("?***");
+                i = j;
+                continue;
+            }
+        }
+        let masked_to = if s[i..].starts_with("Bearer ") || s[i..].starts_with("bearer ") {
+            // ② Authorization 头形态
+            let mut j = i + 7;
+            while j < b.len() && !matches!(b[j], b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b')') {
+                j += 1;
+            }
+            (j >= i + 10).then_some(j) // 至少几位 token 才值得掩
+        } else if s[i..].starts_with("sk-") {
+            // ③ OpenAI 风格凭证
+            let mut j = i + 3;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-' || b[j] == b'_') {
+                j += 1;
+            }
+            (j - i >= 16).then_some(j)
+        } else if s[i..].starts_with("key=") {
+            // ④ Steam 风格 key=<32位凭证>，泛化为 ≥16 位
+            let mut j = i + 4;
+            while j < b.len() && b[j].is_ascii_alphanumeric() {
+                j += 1;
+            }
+            (j - i >= 20).then_some(j)
+        } else {
+            None
+        };
+        if let Some(j) = masked_to {
+            // 保留前缀（Bearer / sk- / key=），其余掩码
+            let prefix_end = match () {
+                _ if s[i..].starts_with("Bearer ") => 7,
+                _ if s[i..].starts_with("bearer ") => 7,
+                _ if s[i..].starts_with("sk-") => 3,
+                _ => 4, // key=
+            };
+            out.push_str(&s[i..i + prefix_end]);
+            out.push_str("***");
+            i = j;
+            continue;
+        }
+        // 普通字符：整字符拷贝（i 只会停在 ASCII 或字符边界）
+        let ch = s[i..].chars().next().expect("非空");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+impl LlmError {
+    /// 按错误形态给中文排查指引（None = 无特定建议，展示原始错误即可）。
+    /// 与 server 侧 friendly_sync_error 对称——LLM 侧此前只有裸技术错误。
+    pub fn friendly_hint(&self) -> Option<String> {
+        match self {
+            LlmError::Http { status: 401, .. } => {
+                Some("LLM 返回 401：API Key 无效或未授权，请到服务商控制台核对 Key".into())
+            }
+            LlmError::Http { status: 402, .. } => {
+                Some("LLM 返回 402：账户余额不足，请到服务商控制台充值后重试".into())
+            }
+            LlmError::Http { status: 403, .. } => {
+                Some("LLM 返回 403：Key 无权访问该模型或端点，核对 Key 权限或换模型".into())
+            }
+            LlmError::Http { status: 404, .. } => {
+                Some("LLM 返回 404：多半是 base_url 缺 /v1 或路径多写，请检查服务地址".into())
+            }
+            LlmError::Http { status: 429, .. } => {
+                Some("LLM 返回 429：触发服务商限流（已自动退避重试仍失败），稍等片刻再试".into())
+            }
+            LlmError::Network(e) if e.contains("timed out") || e.contains("timeout") => {
+                Some("LLM 请求超时：检查网络或代理设置后重试".into())
+            }
+            LlmError::Network(_) => {
+                Some("LLM 网络错误：检查网络连通性；大陆网络访问境外端点通常需要代理".into())
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriceSource {
     Builtin,
@@ -161,15 +262,15 @@ pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<String>, 
         .bearer_auth(api_key.trim())
         .send()
         .await
-        .map_err(|e| LlmError::Network(e.to_string()))?;
+        .map_err(|e| LlmError::Network(redact(&e.to_string())))?;
     let status = resp.status().as_u16();
-    let text = resp.text().await.map_err(|e| LlmError::Network(e.to_string()))?;
+    let text = resp.text().await.map_err(|e| LlmError::Network(redact(&e.to_string())))?;
     if !(200..300).contains(&status) {
         let msg = serde_json::from_str::<Value>(&text)
             .ok()
             .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
             .unwrap_or_else(|| crate::steam_client::truncate(&text, 200));
-        return Err(LlmError::Http { status, msg });
+        return Err(LlmError::Http { status, msg: redact(&msg) });
     }
     Ok(parse_models_response(&text))
 }
@@ -191,6 +292,28 @@ fn parse_models_response(text: &str) -> Vec<String> {
             ids
         })
         .unwrap_or_default()
+}
+
+/// 解析流式 SSE 的一条 data 载荷（纯函数，便于单测）：
+/// 返回本条携带的增量文本（无则为 None）；usage chunk（include_usage 的流末帧）写入 usage。
+fn parse_stream_data(data: &str, usage: &mut Option<Usage>) -> Option<String> {
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    let v: Value = serde_json::from_str(data).ok()?;
+    if v["usage"].is_object() && v["usage"]["prompt_tokens"].as_u64().is_some() {
+        *usage = Some(Usage {
+            prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+            completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+            cached_prompt_tokens: v["usage"]["prompt_cache_hit_tokens"]
+                .as_u64()
+                .or_else(|| v["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64())
+                .unwrap_or(0),
+        });
+    }
+    v["choices"][0]["delta"]["content"]
+        .as_str()
+        .map(str::to_string)
 }
 
 /// 服务商/模型参数约束（快照 2026-09-06，依各家官方文档与社区实测核准）：
@@ -246,6 +369,7 @@ pub fn builtin_param_rule(base_url: &str, model: &str) -> ParamRule {
     PARAM_DEFAULT
 }
 
+#[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
     base_url: String,
@@ -313,6 +437,72 @@ impl LlmClient {
         }
     }
 
+    /// 构造请求体（chat / chat_stream 共用）：全局 thinking 关闭、参数约束适配、
+    /// json_mode；stream / include_usage 仅流式变体置 true。
+    fn compose_body(
+        &self,
+        messages: &[ChatMessage],
+        temperature: f32,
+        json_out: bool,
+        with_temp: bool,
+        budget: u32,
+        with_thinking: bool,
+        stream: bool,
+        include_usage: bool,
+    ) -> Value {
+        let rule = builtin_param_rule(&self.base_url, &self.model);
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages
+                .iter()
+                .map(|m| json!({"role": m.role, "content": m.content}))
+                .collect::<Vec<_>>(),
+            "stream": stream,
+        });
+        if with_temp {
+            body["temperature"] = json!(temperature);
+        }
+        body[rule.max_tokens_field] = json!(budget);
+        if with_thinking {
+            body["thinking"] = json!({"type": "disabled"});
+        }
+        if json_out {
+            body["response_format"] = json!({"type": "json_object"});
+        }
+        if stream && include_usage {
+            // OpenAI 兼容端点需要显式声明才在流末返回 usage（DeepSeek 同样支持）
+            body["stream_options"] = json!({"include_usage": true});
+        }
+        body
+    }
+
+    /// 按当前价格与用量计费（chat / chat_stream 共用）。
+    /// DeepSeek 内置表按官方规则区分时段：高峰全价、空闲半价（北京时间自动判断）；
+    /// 手动配置的价格（Config/LocalFree）按用户填写值原样计，不做时段折算。
+    /// 缓存命中的输入按命中价计（DeepSeek 约为全价的 1/30），缺失缓存价时按全价保守。
+    fn cost_of(&self, usage: &Usage) -> Option<f64> {
+        let time_mult = if self.price_source == PriceSource::Builtin
+            && !beijing_peak(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            ) {
+            0.5
+        } else {
+            1.0
+        };
+        self.price.map(|p| {
+            let cached = usage.cached_prompt_tokens.min(usage.prompt_tokens) as f64;
+            let fresh = usage.prompt_tokens as f64 - cached;
+            let cache_price = p.cache_input_per_m.unwrap_or(p.input_per_m);
+            (fresh / 1e6 * p.input_per_m
+                + cached / 1e6 * cache_price
+                + usage.completion_tokens as f64 / 1e6 * p.output_per_m)
+                * time_mult
+        })
+    }
+
     /// chat/completions。json_mode=true 时请求 JSON 输出；端点不支持 response_format 时自动降级重试一次。
     /// 所有调用一律带 thinking:{type:disabled}（本应用的任务都不需要思考；DeepSeek V4 等
     /// 默认思考模型会把小预算的回答挤成空响应）。表外服务商双重兜底：400 按错误文本降级
@@ -329,25 +519,7 @@ impl LlmClient {
         let rule = builtin_param_rule(&self.base_url, &self.model);
         let url = format!("{}/chat/completions", self.base_url);
         let build = |json_out: bool, with_temp: bool, budget: u32, with_thinking: bool| {
-            let mut body = json!({
-                "model": self.model,
-                "messages": messages
-                    .iter()
-                    .map(|m| json!({"role": m.role, "content": m.content}))
-                    .collect::<Vec<_>>(),
-                "stream": false,
-            });
-            if with_temp {
-                body["temperature"] = json!(temperature);
-            }
-            body[rule.max_tokens_field] = json!(budget);
-            if with_thinking {
-                body["thinking"] = json!({"type": "disabled"});
-            }
-            if json_out {
-                body["response_format"] = json!({"type": "json_object"});
-            }
-            body
+            self.compose_body(messages, temperature, json_out, with_temp, budget, with_thinking, false, false)
         };
         let (mut status, mut text) =
             self.post(&url, build(json_mode, !rule.omit_temperature, max_tokens, true)).await?;
@@ -377,7 +549,7 @@ impl LlmClient {
                 .ok()
                 .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
                 .unwrap_or_else(|| crate::steam_client::truncate(&text, 200));
-            return Err(LlmError::Http { status, msg });
+            return Err(LlmError::Http { status, msg: redact(&msg) });
         }
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| LlmError::Network(format!("响应解析失败: {e}")))?;
@@ -418,30 +590,121 @@ impl LlmClient {
                 .or_else(|| v["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64())
                 .unwrap_or(0),
         };
-        // DeepSeek 内置表按官方规则区分时段：高峰全价、空闲半价（北京时间自动判断）；
-        // 手动配置的价格（Config/LocalFree）按用户填写值原样计，不做时段折算。
-        // 缓存命中的输入按命中价计（DeepSeek 约为全价的 1/30），缺失缓存价时按全价保守
-        let time_mult = if self.price_source == PriceSource::Builtin
-            && !beijing_peak(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-            ) {
-            0.5
-        } else {
-            1.0
-        };
-        let cost = self.price.map(|p| {
-            let cached = usage.cached_prompt_tokens.min(usage.prompt_tokens) as f64;
-            let fresh = usage.prompt_tokens as f64 - cached;
-            let cache_price = p.cache_input_per_m.unwrap_or(p.input_per_m);
-            (fresh / 1e6 * p.input_per_m
-                + cached / 1e6 * cache_price
-                + usage.completion_tokens as f64 / 1e6 * p.output_per_m)
-                * time_mult
-        });
+        let cost = self.cost_of(&usage);
         Ok(ChatOutput { content, usage, model: self.model.clone(), cost_cny: cost })
+    }
+
+    /// 流式 chat（推荐卡生成专用，v0.49）：增量文本经 on_delta 实时回调——前端据此
+    /// 展示"推荐语 x/3"逐张进度。与 chat() 共用 compose_body（thinking 关闭/参数适配/
+    /// json_mode 全沿用）；400 按错误文本剥离重试一次（多一个 stream_options 分支）；
+    /// usage 取流末 chunk（stream_options.include_usage），服务商不给则计 0 并告警。
+    pub async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        temperature: f32,
+        json_mode: bool,
+        max_tokens: u32,
+        on_delta: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<ChatOutput, LlmError> {
+        let rule = builtin_param_rule(&self.base_url, &self.model);
+        let url = format!("{}/chat/completions", self.base_url);
+        let body = self.compose_body(messages, temperature, json_mode, !rule.omit_temperature, max_tokens, true, true, true);
+        let mut resp = self.send_stream(&url, &body).await?;
+        let mut status = resp.status().as_u16();
+        if status == 400 {
+            let text = resp.text().await.unwrap_or_default();
+            let lower = text.to_ascii_lowercase();
+            let drop_temp = !rule.omit_temperature && lower.contains("temperature");
+            let drop_thinking = lower.contains("thinking");
+            let drop_so = lower.contains("stream_options");
+            if drop_temp || drop_thinking || drop_so || json_mode {
+                let retry = self.compose_body(
+                    messages,
+                    temperature,
+                    !drop_thinking && json_mode,
+                    !drop_temp && !rule.omit_temperature,
+                    max_tokens,
+                    !drop_thinking,
+                    true,
+                    !drop_so,
+                );
+                resp = self.send_stream(&url, &retry).await?;
+                status = resp.status().as_u16();
+            } else {
+                // 没有可剥离的字段：直接按 400 报错（resp 已被读空）
+                let msg = serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| crate::steam_client::truncate(&text, 200));
+                return Err(LlmError::Http { status, msg: redact(&msg) });
+            }
+        }
+        if !(200..300).contains(&status) {
+            let text = resp.text().await.unwrap_or_default();
+            let msg = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+                .unwrap_or_else(|| crate::steam_client::truncate(&text, 200));
+            return Err(LlmError::Http { status, msg: redact(&msg) });
+        }
+        use tokio_stream::StreamExt;
+        let mut content = String::new();
+        let mut usage: Option<Usage> = None;
+        let mut buf = String::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| LlmError::Network(redact(&e.to_string())))?;
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buf.find('\n') {
+                let line: String = buf.drain(..=pos).collect();
+                let line = line.trim_end_matches(['\n', '\r']);
+                let Some(data) = line.strip_prefix("data:") else { continue };
+                if let Some(delta) = parse_stream_data(data.trim(), &mut usage) {
+                    content.push_str(&delta);
+                    on_delta(&delta);
+                }
+            }
+        }
+        if content.trim().is_empty() {
+            return Err(LlmError::EmptyContent);
+        }
+        let usage = usage.unwrap_or_else(|| {
+            tracing::warn!("流式响应未返回 usage（服务商可能不支持 stream_options），本次按 0 计");
+            Usage { prompt_tokens: 0, completion_tokens: 0, cached_prompt_tokens: 0 }
+        });
+        let cost = self.cost_of(&usage);
+        Ok(ChatOutput { content, usage, model: self.model.clone(), cost_cny: cost })
+    }
+
+    /// 流式请求发送（429/5xx 退避重试与 post() 同口径，但成功时把 Response 留给调用方流式消费）
+    async fn send_stream(&self, url: &str, body: &Value) -> Result<reqwest::Response, LlmError> {
+        let mut attempt = 0u32;
+        loop {
+            let resp = self
+                .http
+                .post(url)
+                .bearer_auth(&self.api_key)
+                .json(body)
+                .send()
+                .await
+                .map_err(|e| LlmError::Network(redact(&e.to_string())))?;
+            let status = resp.status().as_u16();
+            if status == 429 || (500..600).contains(&status) {
+                attempt += 1;
+                let text = resp.text().await.unwrap_or_default();
+                if attempt >= 3 {
+                    return Err(LlmError::Http {
+                        status,
+                        msg: redact(&crate::steam_client::truncate(&text, 200)),
+                    });
+                }
+                let wait = Duration::from_millis(1_000u64 << attempt);
+                tracing::warn!("LLM HTTP {status}，退避 {:?} 后重试", wait);
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            return Ok(resp);
+        }
     }
 
     async fn post(&self, url: &str, body: Value) -> Result<(u16, String), LlmError> {
@@ -454,16 +717,16 @@ impl LlmClient {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|e| LlmError::Network(e.to_string()))?;
+                .map_err(|e| LlmError::Network(redact(&e.to_string())))?;
             let status = resp.status().as_u16();
             let text = resp
                 .text()
                 .await
-                .map_err(|e| LlmError::Network(e.to_string()))?;
+                .map_err(|e| LlmError::Network(redact(&e.to_string())))?;
             if status == 429 || (500..600).contains(&status) {
                 attempt += 1;
                 if attempt >= 3 {
-                    return Err(LlmError::Http { status, msg: crate::steam_client::truncate(&text, 200) });
+                    return Err(LlmError::Http { status, msg: redact(&crate::steam_client::truncate(&text, 200)) });
                 }
                 let wait = Duration::from_millis(1_000u64 << attempt);
                 tracing::warn!("LLM HTTP {status}，退避 {:?} 后重试", wait);
@@ -478,6 +741,73 @@ impl LlmClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_stream_data_extracts_deltas_and_usage() {
+        let mut usage = None;
+        // 普通增量
+        let d = parse_stream_data(r#"{"choices":[{"delta":{"content":"{\"cards\":["}}]}"#, &mut usage).unwrap();
+        assert_eq!(d, "{\"cards\":[");
+        assert!(usage.is_none());
+        // usage 帧（include_usage 的流末 chunk）：choices 为空数组，只带 usage
+        let d = parse_stream_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":35,"prompt_cache_hit_tokens":80}}"#,
+            &mut usage,
+        );
+        assert!(d.is_none());
+        let u = usage.unwrap();
+        assert_eq!((u.prompt_tokens, u.completion_tokens, u.cached_prompt_tokens), (120, 35, 80));
+        // OpenAI 风格缓存字段
+        let mut usage2 = None;
+        parse_stream_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":4}}}"#,
+            &mut usage2,
+        );
+        assert_eq!(usage2.unwrap().cached_prompt_tokens, 4);
+        // DONE / 空行 / 非法 JSON / 无 delta 的帧
+        let mut u3 = None;
+        assert!(parse_stream_data("[DONE]", &mut u3).is_none());
+        assert!(parse_stream_data("", &mut u3).is_none());
+        assert!(parse_stream_data("not json", &mut u3).is_none());
+        assert!(parse_stream_data(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#, &mut u3).is_none());
+        assert!(u3.is_none());
+    }
+
+    #[test]
+    fn redact_masks_urls_bearers_and_token_forms() {
+        // ① base_url 拼 key 的 URL 查询串（reqwest Network 错误的常见形态）
+        let s = "error sending request for url (https://api.x.com/v1/chat/completions?key=abcdefghij1234567890)";
+        let r = redact(s);
+        assert!(r.contains("?***") && r.ends_with(')'), "{r}");
+        assert!(!r.contains("abcdefghij"));
+        // ② Bearer 头
+        let r = redact("header 'Bearer sk-1234567890abcdef1234' invalid");
+        assert!(r.contains("Bearer ***"), "{r}");
+        assert!(!r.contains("sk-1234567890"));
+        // ③ sk- 凭证（≥16 位才掩，短词不误伤）
+        let r = redact("key sk-abcdefghijklmnop123456 rejected");
+        assert!(r.contains("sk-***"), "{r}");
+        assert_eq!(redact("prefix sk-short ok"), "prefix sk-short ok");
+        // ④ Steam 风格 key=
+        let r = redact("url?key=0123456789ABCDEF0123456789ABCDEF&x=1");
+        assert!(r.contains("key=***"), "{r}");
+        assert!(!r.contains("0123456789ABCDEF"));
+        // 中文正文与非 URL 问号不受影响
+        assert_eq!(redact("网络错误：连接被重置？请检查代理"), "网络错误：连接被重置？请检查代理");
+        // 无查询串的 URL 原样保留
+        assert_eq!(redact("https://api.deepseek.com/v1"), "https://api.deepseek.com/v1");
+    }
+
+    #[test]
+    fn friendly_hint_maps_common_llm_failures() {
+        assert!(LlmError::Http { status: 401, msg: String::new() }.friendly_hint().unwrap().contains("401"));
+        assert!(LlmError::Http { status: 402, msg: String::new() }.friendly_hint().unwrap().contains("余额"));
+        assert!(LlmError::Http { status: 429, msg: String::new() }.friendly_hint().unwrap().contains("限流"));
+        assert!(LlmError::Http { status: 404, msg: String::new() }.friendly_hint().unwrap().contains("/v1"));
+        assert!(LlmError::Network("operation timed out".into()).friendly_hint().unwrap().contains("超时"));
+        assert!(LlmError::Network("connection reset".into()).friendly_hint().unwrap().contains("网络"));
+        assert_eq!(LlmError::EmptyContent.friendly_hint(), None);
+    }
 
     #[test]
     fn builtin_price_matches_models_and_suffixes() {

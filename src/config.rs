@@ -21,6 +21,8 @@ api_key_env = "STEAM_WEB_API_KEY"
 # 访问 Steam API 的代理，如 "http://127.0.0.1:7897"；
 # 留空 = 自动（环境变量 HTTPS_PROXY → Windows 系统代理）
 proxy = ""
+# 下载带宽估算（Mbps）：预约下载的时长提示用；设置页「下载带宽参考」同款（热存数据库）
+download_speed_mbps = 100.0
 
 [agent]
 active_llm = "deepseek"
@@ -41,6 +43,9 @@ context_tokens = 65536
 [profile]
 idle_min_minutes = 300
 idle_easy_rate = 0.20
+# 里程碑通关判定：通关标记类（completion）成就的全球完成度百分比上限
+# （高于此值视为"太多人有"，不足以证明触及终点；热门老游戏可适当调高）
+finished_mark_max_pct = 55.0
 # 剧情覆盖率判通关（v0.46）：拿到 ≥80% 的剧情/通关类成就（合作/竞技不计入分母）
 # 即视为已完成主线——非成就党通关路径；成就数 <10 的游戏信号弱，要求全拿
 story_finish_rate = 0.80

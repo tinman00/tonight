@@ -105,6 +105,8 @@ pub async fn run(db: &Path, config_path: &Path, cfg: Config, open_browser: bool,
         .route("/api/settings", get(api_settings).post(api_settings_post))
         .route("/api/secrets", get(api_secrets_get).post(api_secrets_post))
         .route("/api/llm/models", post(api_llm_models))
+        .route("/api/llm/test", post(api_llm_test))
+        .route("/api/steam/test", post(api_steam_test))
         .route("/api/llm/hint", get(api_llm_hint))
         .route("/api/annotation", post(api_annotation))
         .route("/api/override", post(api_override))
@@ -117,10 +119,12 @@ pub async fn run(db: &Path, config_path: &Path, cfg: Config, open_browser: bool,
         .route("/api/sync/stop", post(api_sync_stop))
         .route("/api/repair", post(api_repair))
         .route("/api/bootstrap", get(api_bootstrap))
+        .route("/api/paths", get(api_paths))
         .route("/api/onboarding/complete", post(api_onboarding_complete))
         .route("/api/ask", post(api_ask))
-        .layer(middleware::from_fn(localhost_only))
+        // fallback 先于 layer 注册：静态文件同样过 Host 校验（DNS rebinding 防线不留豁口）
         .fallback(static_handler)
+        .layer(middleware::from_fn(localhost_only))
         .with_state(app);
     // 绑定首选端口；被占用则自动顺延（8787 这类端口在开发机上很常见），最多试 16 个
     let (listener, actual) = bind_with_fallback(port, 16).await?;
@@ -698,7 +702,7 @@ async fn api_secrets_post(State(app): State<Shared>, Json(req): Json<SecretsReq>
     Json(key_status(&cfg))
 }
 
-// ============ LLM 服务探测（获取模型列表）============
+// ============ LLM / Steam 连接探测（测试连接按钮，v0.48）============
 
 #[derive(serde::Deserialize, Default)]
 struct LlmModelsReq {
@@ -708,35 +712,169 @@ struct LlmModelsReq {
     key: Option<String>,
 }
 
-async fn api_llm_models(State(app): State<Shared>, body: String) -> impl IntoResponse {
-    let req = serde_json::from_str::<LlmModelsReq>(&body).unwrap_or_default();
-    let cfg = app.cfg.lock().unwrap().clone();
+/// LLM 错误 → 中文排查指引 + 原始错误（有指引才加前缀）
+fn llm_err_text(e: &crate::llm::LlmError) -> String {
+    match e.friendly_hint() {
+        Some(hint) => format!("{hint}（{e}）"),
+        None => format!("{e}"),
+    }
+}
+
+/// anyhow 链上找 LlmError 做 friendly 化（/api/ask 等聚合错误路径用）；找不到保留原链
+fn friendly_llm_error(e: &anyhow::Error) -> String {
+    let mut cur: Option<&dyn std::error::Error> = Some(e.as_ref());
+    while let Some(err) = cur {
+        if let Some(le) = err.downcast_ref::<crate::llm::LlmError>() {
+            return llm_err_text(le);
+        }
+        cur = err.source();
+    }
+    format!("{e:#}")
+}
+
+/// 解析 LLM 探测的 base_url/key（请求值优先 → 生效配置/环境变量回退）。
+/// 请求携带的临时 key 同样过 validate_key（防脏值直接打向网络）。
+fn resolve_llm_probe(
+    cfg: &crate::config::Config,
+    req_base: Option<&str>,
+    req_key: Option<&str>,
+) -> Result<(String, String), String> {
     let profile = cfg.agent.active_llm.as_ref().and_then(|n| cfg.llm.get(n));
-    let base_url = req
-        .base_url
-        .map(|s| s.trim().to_string())
+    let base_url = req_base
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .or_else(|| profile.map(|p| p.base_url.clone()));
-    // key 优先取请求值，否则按当前生效的变量名读环境变量（.env 启动时已加载）
-    let key = req
-        .key
-        .map(|s| s.trim().to_string())
+        .map(str::to_string)
+        .or_else(|| profile.map(|p| p.base_url.clone()))
+        .ok_or_else(|| "未提供 base_url，且当前没有生效的 LLM 服务".to_string())?;
+    let key = req_key
+        .map(str::trim)
         .filter(|s| !s.is_empty())
+        .map(str::to_string)
         .or_else(|| {
             profile
                 .and_then(|p| std::env::var(&p.api_key_env).ok())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-        });
-    let Some(base_url) = base_url else {
-        return err_json("未提供 base_url，且当前没有生效的 LLM 服务");
-    };
-    let Some(key) = key else {
-        return err_json("请先填写 LLM API Key");
+        })
+        .ok_or_else(|| "请先填写 LLM API Key".to_string())?;
+    let key = crate::secrets::validate_key(&key).map_err(|e| format!("Key 格式问题：{e}"))?;
+    Ok((base_url, key))
+}
+
+async fn api_llm_models(State(app): State<Shared>, body: String) -> impl IntoResponse {
+    let req = serde_json::from_str::<LlmModelsReq>(&body).unwrap_or_default();
+    let cfg = app.cfg.lock().unwrap().clone();
+    let (base_url, key) = match resolve_llm_probe(&cfg, req.base_url.as_deref(), req.key.as_deref()) {
+        Ok(v) => v,
+        Err(msg) => return err_json(msg),
     };
     match crate::llm::fetch_models(&base_url, &key).await {
         Ok(models) => Json(json!({ "models": models })),
-        Err(e) => err_json(format!("{e:#}")),
+        Err(e) => err_json(llm_err_text(&e)),
+    }
+}
+
+/// LLM 配置一键测试（免费）：GET /models 探活端点 + Key，顺带核对目标模型是否在列表中。
+/// 不发 chat 请求，零 token 消耗、无限流压力（用户反馈：测试要考虑限流和计费）。
+async fn api_llm_test(State(app): State<Shared>, body: String) -> impl IntoResponse {
+    #[derive(serde::Deserialize, Default)]
+    struct LlmTestReq {
+        base_url: Option<String>,
+        key: Option<String>,
+        model: Option<String>,
+    }
+    let req = serde_json::from_str::<LlmTestReq>(&body).unwrap_or_default();
+    let cfg = app.cfg.lock().unwrap().clone();
+    let (base_url, key) = match resolve_llm_probe(&cfg, req.base_url.as_deref(), req.key.as_deref()) {
+        Ok(v) => v,
+        Err(msg) => return Json(json!({ "ok": false, "message": msg })),
+    };
+    let profile = cfg.agent.active_llm.as_ref().and_then(|n| cfg.llm.get(n));
+    let model = req
+        .model
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| profile.map(|p| p.model.clone()))
+        .unwrap_or_default();
+    match crate::llm::fetch_models(&base_url, &key).await {
+        Ok(models) => {
+            let known = models.iter().any(|m| *m == model);
+            let note = if model.is_empty() {
+                String::new()
+            } else if known {
+                format!("，模型 {model} 在列表中")
+            } else {
+                // DeepSeek 的 deepseek-chat 是官方别名，不在 /models 返回里也合法——提示但不判失败
+                format!("；注意：模型 {model} 不在返回列表中（官方别名如 deepseek-chat 可能如此，可照常使用）")
+            };
+            Json(json!({
+                "ok": true,
+                "message": format!("连接成功：端点与 Key 有效，共 {} 个模型（免费探测，未消耗 tokens）{}", models.len(), note),
+                "models": models,
+            }))
+        }
+        Err(e) => Json(json!({ "ok": false, "message": llm_err_text(&e) })),
+    }
+}
+
+/// Steam Web API Key 一键测试：resolve_vanity 探活（1 次调用、不触碰用户库数据）。
+/// 返回 200 即 Key 有效；401 = Key 无效；网络错误提示代理。
+async fn api_steam_test(State(app): State<Shared>, body: String) -> impl IntoResponse {
+    #[derive(serde::Deserialize, Default)]
+    struct SteamTestReq {
+        key: Option<String>,
+    }
+    let req = serde_json::from_str::<SteamTestReq>(&body).unwrap_or_default();
+    let cfg = app.cfg.lock().unwrap().clone();
+    let key_env = if cfg.steam.api_key_env.trim().is_empty() {
+        crate::config::DEFAULT_KEY_ENV.to_string()
+    } else {
+        cfg.steam.api_key_env.trim().to_string()
+    };
+    let key = req
+        .key
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var(&key_env)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    let Some(key) = key else {
+        return Json(json!({ "ok": false, "message": format!("尚未填写 Steam Web API Key（{key_env}）") }));
+    };
+    if let Err(e) = crate::secrets::validate_key(&key) {
+        return Json(json!({ "ok": false, "message": format!("Key 格式问题：{e}") }));
+    }
+    let proxy = crate::steam_client::resolve_proxy(cfg.proxy());
+    let client = match crate::steam_client::SteamClient::new(Some(key), key_env, proxy) {
+        Ok(c) => c,
+        Err(e) => return Json(json!({ "ok": false, "message": format!("{e}") })),
+    };
+    // Gabe 的 vanity 名——只为验证 Key 能过鉴权，不涉及任何用户数据
+    match client.resolve_vanity("gabelogannewell").await {
+        Ok(_) => Json(json!({ "ok": true, "message": "连接成功：Steam Web API Key 有效（一次探测调用，未读取你的数据）" })),
+        Err(e) => {
+            let msg = match &e {
+                crate::steam_client::SteamError::Http { status: 401, .. } => {
+                    "Steam 返回 401：Key 无效，请到 steamcommunity.com/dev/apikey 重新生成".to_string()
+                }
+                // 实测：resolve_vanity 对无效 Key 返回 403 且正文注明 verify your key=
+                // （GetOwnedGames 才是 401/403=资料不公开），两种可能都提示
+                crate::steam_client::SteamError::Http { status: 403, .. } => {
+                    "Steam 返回 403：Key 无效，或代理出口受限——先核对 Key，仍失败再检查代理设置".to_string()
+                }
+                crate::steam_client::SteamError::Http { status: 429, .. } => {
+                    "Steam 返回 429：触发限流，稍等片刻再测".to_string()
+                }
+                crate::steam_client::SteamError::Network(_) => {
+                    "网络错误：连不上 api.steampowered.com；大陆网络通常需要代理（config.toml [network] proxy 或系统代理）".to_string()
+                }
+                other => format!("{other}"),
+            };
+            Json(json!({ "ok": false, "message": format!("{msg}（{e}）") }))
+        }
     }
 }
 
@@ -1005,9 +1143,17 @@ async fn api_sessions(State(app): State<Shared>) -> impl IntoResponse {
                 .ok()
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                 .map(|v| {
+                    // 首轮用户输入截断作列表预览（历史页一眼认出是哪次会话）
+                    let preview = v["turns"][0]["user"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(30)
+                        .collect::<String>();
                     json!({
                         "created_at": v["created_at"],
                         "turns": v["turns"].as_array().map(|a| a.len()).unwrap_or(0),
+                        "preview": preview,
                     })
                 })
                 .unwrap_or(json!({"created_at": 0, "turns": 0}));
@@ -1102,8 +1248,11 @@ async fn api_sync_start(
                 skip_llm: req.skip_llm.unwrap_or(false),
             },
             token,
-            &move |s: &str| {
-                let _ = progress_tx.send(Ok(sse_event("progress", &json!({"text": s}))));
+            &move |p: &sync::SyncProgress| {
+                let _ = progress_tx.send(Ok(sse_event(
+                    "progress",
+                    &json!({"text": p.text, "pct": p.pct}),
+                )));
             },
         )
         .await;
@@ -1154,14 +1303,17 @@ async fn api_repair(State(app): State<Shared>) -> Sse<UnboundedReceiverStream<Re
             &db,
             &cfg,
             token,
-            &move |s: &str| {
-                let _ = progress_tx.send(Ok(sse_event("progress", &json!({"text": s}))));
+            &move |p: &sync::SyncProgress| {
+                let _ = progress_tx.send(Ok(sse_event(
+                    "progress",
+                    &json!({"text": p.text, "pct": p.pct}),
+                )));
             },
         )
         .await;
         let final_event = match result {
             Ok(_) => sse_event("done", &json!({"message": "修复完成"})),
-            Err(e) => sse_event("error", &json!({"message": format!("{e:#}")})),
+            Err(e) => sse_event("error", &json!({"message": friendly_sync_error(&e)})),
         };
         let _ = tx.send(Ok(final_event));
         *app2.sync_cancel.lock().unwrap() = None;
@@ -1284,15 +1436,43 @@ async fn api_ask(
                 }));
                 send(
                     "done",
-                    &json!({"calls": r.llm_calls, "prompt_tokens": r.prompt_tokens, "completion_tokens": r.completion_tokens}),
+                    &json!({"calls": r.llm_calls, "prompt_tokens": r.prompt_tokens, "completion_tokens": r.completion_tokens, "cost_cny": r.cost_cny}),
                 );
             }
             Err(e) => {
-                send("error", &json!({"message": format!("{e:#}")}));
+                send("error", &json!({"message": friendly_llm_error(&e)}));
             }
         }
     });
     Sse::new(UnboundedReceiverStream::new(rx))
+}
+
+// ============ 本机文件路径（设置页「数据与文件」面板，v0.50）============
+
+/// 各文件解析后的绝对路径 + 版本号（明确配置和数据文件目录）：
+/// 启动时已对齐 exe 目录（发行包任意方式启动都落在包内），这里展示真实落盘位置。
+async fn api_paths(State(app): State<Shared>) -> impl IntoResponse {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let abs = |p: &std::path::Path| -> String {
+        std::fs::canonicalize(p)
+            .map(|x| x.display().to_string().replace("\\\\?\\", "")) // 去 Windows 扩展路径前缀，可读性
+            .unwrap_or_else(|_| cwd.join(p).display().to_string())
+    };
+    let logs = app
+        .db
+        .parent()
+        .unwrap_or(std::path::Path::new("data"))
+        .join("logs")
+        .join("tonight.log");
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "config": abs(&app.config_path),
+        "env": abs(std::path::Path::new(".env")),
+        "db": abs(&app.db),
+        "sessions": abs(&app.sessions_dir),
+        "logs": abs(&logs),
+        "web": abs(std::path::Path::new("web")),
+    }))
 }
 
 // ============ 静态文件（web/ 目录，无构建链） ============

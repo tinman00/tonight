@@ -147,11 +147,13 @@ function initEmptyPage() {
 initEmptyPage();
 
 // ============ 对话（纵向 fullpage 整页 + 横向 peek 轮播，CTA 卡滑到即换批） ============
+// 会话 ID 用 sessionStorage：每次打开页面 = 一个新会话（历史页按访问分组），
+// 同一次访问内的多轮对话仍归入同一会话
 const SESSION = (() => {
-  let id = localStorage.getItem("wtp_session");
+  let id = sessionStorage.getItem("wtp_session");
   if (!id) {
     id = String(Date.now());
-    localStorage.setItem("wtp_session", id);
+    sessionStorage.setItem("wtp_session", id);
   }
   return id;
 })();
@@ -405,6 +407,14 @@ async function streamAsk(message, t) {
     if (ev.type === "trace") {
       t.trace.appendChild(el("div", "trace", ev.payload.text));
       t.trace.scrollTop = t.trace.scrollHeight;
+      // 占位卡/CTA/状态行跟随最新阶段（"正在理解偏好…"→"推荐语 2/3"）——首屏生成与换批共用
+      const gb = t.track.querySelector(".gen-box span:last-child");
+      if (gb && t.generating) gb.textContent = ev.payload.text;
+      const ctaSpin = t.track.querySelector(".cta .spin");
+      if (ctaSpin && t.loading && ctaSpin.nextSibling) {
+        ctaSpin.nextSibling.textContent = " " + ev.payload.text;
+      }
+      if (t.generating) t.info.textContent = ev.payload.text;
     } else if (ev.type === "cards") {
       t.generating = false;
       t.relaxable = !!ev.payload.relaxable;
@@ -421,8 +431,9 @@ async function streamAsk(message, t) {
         rebuildTrack(t, first); // 首批原位替换占位卡；换批保留滑动动画
       }
     } else if (ev.type === "done") {
+      const cost = ev.payload.cost_cny != null ? ` · ¥${ev.payload.cost_cny.toFixed(4)}` : "";
       t.trace.appendChild(
-        el("div", "trace", `本轮 ${ev.payload.calls} 次调用 · ${ev.payload.prompt_tokens} 入 / ${ev.payload.completion_tokens} 出 tokens`)
+        el("div", "trace", `本轮 ${ev.payload.calls} 次调用 · ${ev.payload.prompt_tokens} 入 / ${ev.payload.completion_tokens} 出 tokens${cost}`)
       );
       t.trace.scrollTop = t.trace.scrollHeight;
     } else if (ev.type === "error") {
@@ -437,7 +448,12 @@ function newTurnPage(text) {
   const page = el("div", "fullpage turn-page");
   const urow = el("div", "turn-user");
   urow.appendChild(el("span", "bubble", text));
+  // 工具调用轨迹（可折叠，默认收起——需要看调用过程时点开，浮层展示不挤压布局）
+  const traceWrap = document.createElement("details");
+  traceWrap.className = "traces-wrap";
+  traceWrap.appendChild(document.createElement("summary"));
   const trace = el("div", "traces");
+  traceWrap.appendChild(trace);
   const viewport = el("div", "carousel");
   const track = el("div", "track");
   viewport.appendChild(track);
@@ -450,7 +466,7 @@ function newTurnPage(text) {
   const stage = el("div", "stage");
   stage.append(prev, viewport, next);
   const info = el("div", "stage-info");
-  page.append(urow, trace, stage, info);
+  page.append(urow, traceWrap, stage, info);
   $("#pages").appendChild(page);
   const t = {
     page, trace, viewport, track, prev, next, info,
@@ -645,6 +661,7 @@ async function loadLibrary() {
       </div>
     </div>
     <div class="muted" style="margin:6px 0 2px">点击游戏左上角的深度角标可手动标注（无成就游戏标「已完成」、长线游戏标「暂离」——手动标注永远优先于自动判定）</div>
+    <div class="pbar hidden" id="lib-sync-bar"><div class="pfill"></div></div>
     <div id="lib-sync-log" class="hidden"></div>`;
     // 识别异常管理：显式列出自动识别可能有问题的游戏（数据类可自动修复，判断类快捷手动标注）
     const anomalies = lib.anomalies || [];
@@ -727,18 +744,21 @@ async function loadLibrary() {
     if (repairBtn) {
       repairBtn.addEventListener("click", async () => {
         const log = $("#lib-repair-log");
+        // 进度条复用：重复修复不重复插条
+        let barBox = log.previousElementSibling;
+        if (!barBox || !barBox.classList || !barBox.classList.contains("pbar")) {
+          barBox = document.createElement("div");
+          barBox.className = "pbar";
+          barBox.innerHTML = '<div class="pfill"></div>';
+          log.before(barBox);
+        }
+        const fill = barBox.querySelector(".pfill");
+        fill.style.width = "0%";
         log.classList.remove("hidden");
         log.textContent = "开始修复…";
         repairBtn.disabled = true;
         await sseStream("/api/repair", {}, (ev) => {
-          if (ev.type === "progress") {
-            log.textContent += "\n" + ev.payload.text;
-          } else if (ev.type === "done") {
-            log.textContent += "\n✔ " + ev.payload.message;
-          } else if (ev.type === "error") {
-            log.textContent += "\n✖ " + ev.payload.message;
-          }
-          log.scrollTop = log.scrollHeight;
+          renderSyncProgress(ev, fill, log);
         });
         repairBtn.disabled = false;
         loadLibrary(); // 修复后异常清单/深度即时刷新
@@ -824,6 +844,7 @@ function renderLibraryEmpty(body) {
       <button class="btn primary" id="lib-sync">⟳ 开始同步</button>
       <span class="muted hidden" id="lib-syncing">同步中…</span>
     </div>
+    <div class="pbar hidden" id="lib-sync-bar"><div class="pfill"></div></div>
     <div id="lib-sync-log" class="hidden"></div>
     <div class="muted" style="margin-top:8px">
       SteamID64 在哪看：Steam 个人资料页地址 …/profiles/ 后面的 17 位数字。首次同步视库大小约 3–15 分钟（数百款游戏时偏上限），之后增量秒级。
@@ -834,28 +855,37 @@ function renderLibraryEmpty(body) {
 
 async function runLibrarySync() {
   const log = $("#lib-sync-log");
+  const bar = $("#lib-sync-bar .pfill");
   const steamid = $("#lib-steamid") ? $("#lib-steamid").value.trim() : "";
   log.classList.remove("hidden");
+  if (bar) bar.classList.remove("hidden");
   log.textContent = "开始同步…";
   $("#lib-sync").disabled = true;
   $("#lib-syncing").classList.remove("hidden");
   let failed = false;
   await sseStream("/api/sync/start", { steamid: steamid || null }, (ev) => {
-    if (ev.type === "progress") {
-      log.textContent += "\n" + ev.payload.text;
-    } else if (ev.type === "done") {
-      log.textContent += "\n✔ " + ev.payload.message;
-    } else if (ev.type === "error") {
-      failed = true;
-      log.textContent += "\n✖ " + ev.payload.message;
-    }
-    log.scrollTop = log.scrollHeight;
+    if (ev.type === "error") failed = true;
+    renderSyncProgress(ev, $("#lib-sync-bar .pfill"), log);
   });
   $("#lib-sync").disabled = false;
   $("#lib-syncing").classList.add("hidden");
   // 失败时保留日志与错误原因（重渲染会把它们吞掉）；成功才刷新库存视图
   if (!failed) loadLibrary();
   checkSyncBanner();
+}
+
+// 同步类 SSE 的统一渲染：进度条 + 文本日志（pct=null 不动条；text 为空只动条——后端心跳事件）
+function renderSyncProgress(ev, bar, log) {
+  if (ev.type === "progress") {
+    if (ev.payload.text) log.textContent += "\n" + ev.payload.text;
+    if (bar && ev.payload.pct != null) bar.style.width = ev.payload.pct + "%";
+  } else if (ev.type === "done") {
+    if (bar) bar.style.width = "100%";
+    log.textContent += "\n✔ " + ev.payload.message;
+  } else if (ev.type === "error") {
+    log.textContent += "\n✖ " + ev.payload.message;
+  }
+  log.scrollTop = log.scrollHeight;
 }
 
 // ============ 画像 ============
@@ -1007,14 +1037,30 @@ async function loadSessions() {
     list.innerHTML = "";
     for (const s of sessions) {
       const t = new Date((s.meta.created_at || 0) * 1000);
+      const preview = s.meta.preview ? `<div class="preview">${esc(s.meta.preview)}</div>` : "";
       const item = el("div", "session-item");
-      item.innerHTML = `<div>${t.toLocaleString("zh-CN")}</div><div class="meta">${s.meta.turns} 轮对话 ›</div>`;
+      item.innerHTML = `<div>${t.toLocaleString("zh-CN")}</div>${preview}<div class="meta">${s.meta.turns} 轮对话 ›</div>`;
       item.addEventListener("click", () => showSession(s.id));
       list.appendChild(item);
     }
   } catch (e) {
     list.innerHTML = `<div class="error-note">加载失败：${esc(e.message)}</div>`;
   }
+}
+
+// 缩略图点击 → 浮层查看原始推荐卡（纯展示，不可交互）
+let cardLightbox = null;
+function openCardLightbox(card) {
+  if (!cardLightbox) {
+    cardLightbox = el("div", "lightbox hidden");
+    cardLightbox.addEventListener("click", () => cardLightbox.classList.add("hidden"));
+    document.body.appendChild(cardLightbox);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") cardLightbox.classList.add("hidden");
+    });
+  }
+  cardLightbox.innerHTML = cardHtml(card);
+  cardLightbox.classList.remove("hidden");
 }
 
 async function showSession(id) {
@@ -1030,8 +1076,19 @@ async function showSession(id) {
     view.appendChild(back);
     for (const turn of s.turns || []) {
       const t = el("div", "turn");
-      t.innerHTML = `<div class="u">你：${esc(turn.user)}</div><div class="i">${esc(turn.intent)}</div>` +
-        (turn.cards || []).map(cardHtml).join("");
+      t.innerHTML = `<div class="u">你：${esc(turn.user)}</div><div class="i">${esc(turn.intent)}</div>`;
+      if ((turn.cards || []).length) {
+        const thumbs = el("div", "thumbs");
+        for (const c of turn.cards) {
+          const th = el("div", "thumb");
+          th.title = c.blurb || c.name;
+          th.innerHTML = `<img src="${cover(c.app_id)}" loading="lazy" onerror="this.style.visibility='hidden'">` +
+            `<div class="tname">《${esc(c.name)}》</div>`;
+          th.addEventListener("click", () => openCardLightbox(c));
+          thumbs.appendChild(th);
+        }
+        t.appendChild(thumbs);
+      }
       view.appendChild(t);
     }
   } catch (e) {
@@ -1043,7 +1100,7 @@ async function showSession(id) {
 async function loadSettings() {
   const body = $("#settings-body");
   try {
-    const [s, u] = await Promise.all([api("/api/settings"), api("/api/usage")]);
+    const [s, u, paths] = await Promise.all([api("/api/settings"), api("/api/usage"), api("/api/paths")]);
     const llmOptions = s.available
       .map((n) => `<option value="${esc(n)}" ${n === s.active_llm ? "selected" : ""}>${esc(n)}</option>`)
       .join("");
@@ -1054,7 +1111,10 @@ async function loadSettings() {
       <div class="muted" id="keys-status">查询中…</div>
       <div class="grid2" style="margin-top:10px">
         <div class="field"><label>Steam Web API Key（<a href="https://steamcommunity.com/dev/apikey" target="_blank" rel="noopener">steamcommunity.com/dev/apikey</a> 免费申请）</label>
-          <input type="password" id="set-steam-key" style="${inputStyle}" autocomplete="off" placeholder="留空 = 不修改"></div>
+          <div style="display:flex;gap:8px">
+            <input type="password" id="set-steam-key" style="${inputStyle}" autocomplete="off" placeholder="留空 = 不修改">
+            <button class="btn" id="set-steam-test" style="white-space:nowrap" title="一次探测调用验证 Key 有效性，不读取你的数据">测试</button>
+          </div></div>
         <div class="field"><label>LLM API Key（DeepSeek 或任意 OpenAI 兼容服务）</label>
           <input type="password" id="set-llm-key" style="${inputStyle}" autocomplete="off" placeholder="留空 = 不修改"></div>
         <div class="field"><label>服务名称（自定义服务起个名字，如 kimi / glm；留空沿用默认）</label>
@@ -1063,10 +1123,10 @@ async function loadSettings() {
           <input id="set-key-env" style="${inputStyle}" value="${esc(s.llm_key_env || "")}" placeholder="DEEPSEEK_API_KEY"></div>
         <div class="field"><label>接口地址 base_url</label>
           <input id="set-base-url" style="${inputStyle}" value="${esc(s.base_url || "")}" placeholder="https://api.deepseek.com/v1"></div>
-        <div class="field"><label>模型名 model（可点「获取模型」从服务端拉取候选）</label>
+        <div class="field"><label>模型名 model（可点「测试连接」验证配置并拉取候选）</label>
           <div style="display:flex;gap:8px">
             <input id="set-model" style="${inputStyle}" value="${esc(s.llm.model || "")}" placeholder="deepseek-chat" list="set-model-list">
-            <button class="btn" id="set-model-fetch" style="white-space:nowrap">获取模型</button>
+            <button class="btn" id="set-model-fetch" style="white-space:nowrap" title="免费探测：GET /models 验证端点与 Key，零 token 消耗">测试连接</button>
             <datalist id="set-model-list"></datalist>
           </div></div>
       </div>
@@ -1110,6 +1170,21 @@ async function loadSettings() {
       </div>
     </div>
     <div class="panel" style="margin-top:16px;max-width:940px">
+      <h4>数据与文件（本机路径，点击复制）</h4>
+      <div class="muted" style="margin:6px 0 8px">全部数据只存本机，不进 git、不进发行包；换电脑把程序目录整个拷走即完成迁移（含 .env / config.toml / data/）。v${esc(paths.version || "")}</div>
+      ${[
+        ["数据库（游戏/画像/用量）", paths.db],
+        ["密钥 .env", paths.env],
+        ["配置 config.toml", paths.config],
+        ["会话存档", paths.sessions],
+        ["运行日志（排障用）", paths.logs],
+      ].filter(([, v]) => v).map(([k, v]) =>
+        `<div style="display:flex;gap:10px;padding:3px 0;align-items:baseline;flex-wrap:wrap">
+           <span class="muted" style="min-width:170px">${k}</span>
+           <code class="path-cell" data-path="${esc(v)}" title="点击复制路径">${esc(v)}</code>
+         </div>`).join("")}
+    </div>
+    <div class="panel" style="margin-top:16px;max-width:940px">
       <h4>数据同步 <button class="btn" id="rerun-onboarding" style="float:right">重新运行首次引导</button></h4>
       <div class="muted" id="sync-status">查询中…</div>
       <div style="display:flex;gap:10px;margin:10px 0;flex-wrap:wrap">
@@ -1117,6 +1192,7 @@ async function loadSettings() {
         <button class="btn primary" id="sync-start">开始同步</button>
         <button class="btn red" id="sync-stop">停止</button>
       </div>
+      <div class="pbar" id="sync-bar" style="display:none"><div class="pfill"></div></div>
       <div id="sync-log">（同步日志）</div>
       <div class="muted" style="margin-top:8px">首次同步含商店详情/标签与成就类型分析（LLM），视库大小约 3–15 分钟（Steam 商店接口限速所致，开始后进度里有更准的预估）；此后增量秒级。所有数据仅存本地。也可以在「游戏库存」页直接点「更新游戏库」。</div>
     </div>`;
@@ -1134,6 +1210,16 @@ async function loadSettings() {
       });
       loadMini();
       loadSettings();
+    });
+    // 数据与文件：路径点击复制
+    body.querySelectorAll(".path-cell").forEach((c) => {
+      c.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(c.dataset.path);
+          c.style.color = "var(--green)";
+          setTimeout(() => (c.style.color = ""), 900);
+        } catch { /* 剪贴板不可用（非安全上下文等）时静默 */ }
+      });
     });
     // 价格字段只在用户改过后才提交——预填值原样回发会把旧价固化成 meta 覆盖，
     // 换模型后仍然生效（计费错乱的来源之一）
@@ -1177,6 +1263,7 @@ async function loadSettings() {
             body: JSON.stringify({ steam_key: steamKey || null, llm_key: llmKey || null }),
           });
         }
+        msg.style.color = "var(--green)";
         msg.textContent = "✔ 已保存并即时生效";
         $("#set-steam-key").value = "";
         $("#set-llm-key").value = "";
@@ -1184,28 +1271,58 @@ async function loadSettings() {
         refreshKeysStatus();
         loadSettings();
       } catch (e) {
+        msg.style.color = "var(--red)";
         msg.textContent = "✖ " + e.message;
       }
     });
-    // 获取模型列表：优先用刚填还没保存的 base_url/key；成功后填入下拉建议（手动输入不受影响）
+    // Steam Key 测试连接：一次探测调用验证 Key（请求值优先，留空用已存值）
+    $("#set-steam-test").addEventListener("click", async () => {
+      const msg = $("#keys-msg");
+      const btn = $("#set-steam-test");
+      btn.disabled = true;
+      msg.style.color = "";
+      msg.textContent = "正在测试 Steam Key（一次探测调用）…";
+      try {
+        const r = await api("/api/steam/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key: $("#set-steam-key").value.trim() || null }),
+        });
+        msg.style.color = r.ok ? "var(--green)" : "var(--red)";
+        msg.textContent = (r.ok ? "✔ " : "✖ ") + r.message;
+      } catch (e) {
+        msg.style.color = "var(--red)";
+        msg.textContent = "✖ " + e.message;
+      }
+      btn.disabled = false;
+    });
+    // LLM 测试连接（免费探测）：验证端点+Key，成功顺带填下拉候选；目标模型不在列表会给提示
     $("#set-model-fetch").addEventListener("click", async () => {
       const msg = $("#keys-msg");
-      msg.textContent = "获取模型列表中…";
+      const btn = $("#set-model-fetch");
+      btn.disabled = true;
+      msg.style.color = "";
+      msg.textContent = "正在测试 LLM 连接（免费探测，不消耗 tokens）…";
       try {
-        const r = await api("/api/llm/models", {
+        const r = await api("/api/llm/test", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             base_url: $("#set-base-url").value.trim(),
             key: $("#set-llm-key").value.trim() || null,
+            model: $("#set-model").value.trim() || null,
           }),
         });
-        $("#set-model-list").innerHTML = r.models.map((m) => `<option value="${esc(m)}">`).join("");
-        msg.textContent = `✔ 已获取 ${r.models.length} 个模型，点击模型名输入框即可选择`;
+        if (r.ok && r.models && r.models.length) {
+          $("#set-model-list").innerHTML = r.models.map((m) => `<option value="${esc(m)}">`).join("");
+        }
+        msg.style.color = r.ok ? "var(--green)" : "var(--red)";
+        msg.textContent = (r.ok ? "✔ " : "✖ ") + r.message;
       } catch (e) {
-        msg.textContent = "✖ " + e.message +
-          (e.message.includes("404") ? "（确认 base_url 是否包含 /v1）" : "");
+        msg.style.color = "var(--red)";
+        msg.textContent = "✖ " + e.message;
       }
+      btn.disabled = false;
     });
     // 参数约束提示 + 价格跟随：规则匹配在后端，前端只展示 notice；
     // syncPrice=true（模型/base_url 被改动时）且价格字段未被手动改过 → 预填同步为
@@ -1304,18 +1421,14 @@ async function refreshSyncStatus() {
 
 async function startSync() {
   const log = $("#sync-log");
+  const bar = $("#sync-bar .pfill");
   const steamid = $("#sync-steamid").value.trim();
   log.textContent = "开始同步…";
+  const barBox = $("#sync-bar");
+  if (barBox) barBox.style.display = "block";
   $("#sync-start").disabled = true;
   await sseStream("/api/sync/start", { steamid: steamid || null }, (ev) => {
-    if (ev.type === "progress") {
-      log.textContent += "\n" + ev.payload.text;
-    } else if (ev.type === "done") {
-      log.textContent += "\n✔ " + ev.payload.message;
-    } else if (ev.type === "error") {
-      log.textContent += "\n✖ " + ev.payload.message;
-    }
-    log.scrollTop = log.scrollHeight;
+    renderSyncProgress(ev, bar, log);
     refreshSyncStatus();
   });
   $("#sync-start").disabled = false;

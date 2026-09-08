@@ -49,16 +49,19 @@
       <h2>填写 API 密钥</h2>
       <p>密钥只写入本目录的 <code>.env</code> 文件，不会出现在对话或日志里；本页也只显示尾 4 位。</p>
       <div class="field"><label>Steam Web API Key（<a href="https://steamcommunity.com/dev/apikey" target="_blank" rel="noopener">点此免费申请</a>）· ${state(st.steam_key_set, st.steam_key_tail)}</label>
-        <input type="password" id="ob-steam-key" class="ob-input" autocomplete="off" placeholder="32 位字母数字"></div>
+        <div style="display:flex;gap:8px">
+          <input type="password" id="ob-steam-key" class="ob-input" autocomplete="off" placeholder="32 位字母数字">
+          <button class="btn" id="ob-steam-test" style="white-space:nowrap" title="一次探测调用验证 Key 有效性，不读取你的数据">测试</button>
+        </div></div>
       <div class="field"><label>LLM API Key（<a href="https://platform.deepseek.com" target="_blank" rel="noopener">DeepSeek 申请页</a>，或任意 OpenAI 兼容服务）· ${state(st.llm_key_set, st.llm_key_tail)}</label>
         <input type="password" id="ob-llm-key" class="ob-input" autocomplete="off" placeholder="sk-…"></div>
       <div class="grid2">
         <div class="field"><label>接口地址 base_url</label>
           <input id="ob-base-url" class="ob-input" value="${esc(st.base_url || "https://api.deepseek.com/v1")}" placeholder="https://api.deepseek.com/v1"></div>
-        <div class="field"><label>模型名 model（可点「获取模型」拉取候选）</label>
+        <div class="field"><label>模型名 model（可点「测试连接」验证配置并拉取候选）</label>
           <div style="display:flex;gap:8px">
             <input id="ob-model" class="ob-input" value="${esc(st.model || "deepseek-chat")}" placeholder="deepseek-chat" list="ob-model-list">
-            <button class="btn" id="ob-model-fetch" style="white-space:nowrap">获取模型</button>
+            <button class="btn" id="ob-model-fetch" style="white-space:nowrap" title="免费探测：GET /models 验证端点与 Key，零 token 消耗">测试连接</button>
             <datalist id="ob-model-list"></datalist>
           </div></div>
       </div>
@@ -95,25 +98,54 @@
           llm_positioning: b.querySelector("#ob-llm-pos").checked,
         }),
       });
-    // 获取模型列表：用刚填还没保存的 base_url/key，成功后填入下拉建议（手动输入不受影响）
+    // Steam Key 测试连接（一次探测调用验证 Key；请求值优先，留空用已存值）
+    b.querySelector("#ob-steam-test").onclick = async () => {
+      const msg = b.querySelector("#ob-msg");
+      const btn = b.querySelector("#ob-steam-test");
+      btn.disabled = true;
+      msg.style.color = "";
+      msg.textContent = "正在测试 Steam Key（一次探测调用）…";
+      try {
+        const r = await api("/api/steam/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key: b.querySelector("#ob-steam-key").value.trim() || null }),
+        });
+        msg.style.color = r.ok ? "var(--green)" : "var(--red)";
+        msg.textContent = (r.ok ? "✔ " : "✖ ") + r.message;
+      } catch (e) {
+        msg.style.color = "var(--red)";
+        msg.textContent = "✖ " + e.message;
+      }
+      btn.disabled = false;
+    };
+    // LLM 测试连接（免费探测）：验证端点+Key，成功顺带填下拉候选
     b.querySelector("#ob-model-fetch").onclick = async () => {
       const msg = b.querySelector("#ob-msg");
-      msg.textContent = "获取模型列表中…";
+      const btn = b.querySelector("#ob-model-fetch");
+      btn.disabled = true;
+      msg.style.color = "";
+      msg.textContent = "正在测试 LLM 连接（免费探测，不消耗 tokens）…";
       try {
-        const r = await api("/api/llm/models", {
+        const r = await api("/api/llm/test", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             base_url: b.querySelector("#ob-base-url").value.trim(),
             key: b.querySelector("#ob-llm-key").value.trim() || null,
+            model: b.querySelector("#ob-model").value.trim() || null,
           }),
         });
-        b.querySelector("#ob-model-list").innerHTML = r.models.map((m) => `<option value="${esc(m)}">`).join("");
-        msg.textContent = `✔ 已获取 ${r.models.length} 个模型，点击模型名输入框即可选择`;
+        if (r.ok && r.models && r.models.length) {
+          b.querySelector("#ob-model-list").innerHTML = r.models.map((m) => `<option value="${esc(m)}">`).join("");
+        }
+        msg.style.color = r.ok ? "var(--green)" : "var(--red)";
+        msg.textContent = (r.ok ? "✔ " : "✖ ") + r.message;
       } catch (e) {
-        msg.textContent = "✖ " + e.message +
-          (e.message.includes("404") ? "（确认 base_url 是否包含 /v1）" : "");
+        msg.style.color = "var(--red)";
+        msg.textContent = "✖ " + e.message;
       }
+      btn.disabled = false;
     };
     // 价格字段只在用户改过后才提交（预填值原样回发会把旧价固化成 meta 覆盖）；
     // 声明在 llmHint 之前——提示刷新会读它判断是否同步价格预填
@@ -210,6 +242,7 @@
         <input id="ob-steamid" class="ob-input" value="${esc(local ? local.steamid : "")}" placeholder="17 位 SteamID64"></div>
       <div class="field"><label>下载带宽参考（Mbps，用于估算"未安装"游戏的下载时长）</label>
         <input id="ob-dl-speed" class="ob-input" type="number" min="1" step="10" value="${Number((typeof getDownloadSpeed === "function" && getDownloadSpeed()) || 100)}"></div>
+      <div class="pbar hidden" id="ob-bar"><div class="pfill"></div></div>
       <div class="ob-log hidden" id="ob-log"></div>
       <div class="ob-msg" id="ob-msg"></div>
       <div class="ob-actions">
@@ -227,12 +260,17 @@
       if (typeof setDownloadSpeed === "function") setDownloadSpeed(speed);
       btn.disabled = true;
       btn.textContent = "同步中…";
+      const bar = b.querySelector("#ob-bar");
+      const fill = b.querySelector("#ob-bar .pfill");
+      if (bar) bar.classList.remove("hidden");
       log.classList.remove("hidden");
       log.textContent = "开始同步…";
       await sseStream("/api/sync/start", { steamid: steamid || null }, (ev) => {
         if (ev.type === "progress") {
-          log.textContent += "\n" + ev.payload.text;
+          if (ev.payload.text) log.textContent += "\n" + ev.payload.text;
+          if (fill && ev.payload.pct != null) fill.style.width = ev.payload.pct + "%";
         } else if (ev.type === "done") {
+          if (fill) fill.style.width = "100%";
           log.textContent += "\n✔ 同步完成";
           setTimeout(() => complete(false), 800);
         } else if (ev.type === "error") {

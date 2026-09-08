@@ -36,19 +36,43 @@ enum Fetched {
     Storage { app_id: u32, res: Result<Option<(Vec<String>, Option<f64>)>, SteamError> },
 }
 
+/// 结构化同步进度（v0.49）：text 进日志；pct（0-100）驱动前端进度条，
+/// None = 本行不改进度（提示/ETA 行）。text 可为空 = 仅推进度条的心跳事件。
+pub struct SyncProgress {
+    pub text: String,
+    pub pct: Option<u8>,
+}
+
+impl SyncProgress {
+    /// 普通日志行（不动进度条）
+    pub fn line(text: &str) -> Self {
+        SyncProgress { text: text.to_string(), pct: None }
+    }
+    /// 带进度的日志行
+    pub fn pct(text: impl Into<String>, pct: u8) -> Self {
+        SyncProgress { text: text.into(), pct: Some(pct) }
+    }
+    /// 仅推进度条（不进日志）
+    pub fn bar(pct: u8) -> Self {
+        SyncProgress { text: String::new(), pct: Some(pct) }
+    }
+}
+
 pub async fn run(
     db: &Path,
     cfg: &Config,
     opts: SyncOptions,
     cancel: CancellationToken,
-    progress: &(dyn Fn(&str) + Send + Sync),
+    report: &(dyn Fn(&SyncProgress) + Send + Sync),
 ) -> Result<()> {
+    // 行文本转发：run 内部的普通行统一走 line（pct 由关键节点单独上报）
+    let line = |text: &str| report(&SyncProgress::line(text));
     let store = Store::open(db).context("打开数据库失败")?;
     let steam_dir = steam_local::resolve_steam_dir(cfg)?;
     let local = SteamLocal::open(&steam_dir);
 
     if opts.local_only {
-        refresh_local(&store, &local, progress)?;
+        refresh_local(&store, &local, &line)?;
         return Ok(());
     }
 
@@ -63,23 +87,25 @@ pub async fn run(
         .filter(|k| !k.is_empty());
     let proxy = crate::steam_client::resolve_proxy(cfg.proxy());
     if let Some(p) = &proxy {
-        progress(&format!("（检测到代理 {p}，Steam API 请求将经由代理）"));
+        line(&format!("（检测到代理 {p}，Steam API 请求将经由代理）"));
     }
     let client = SteamClient::new(api_key, key_env.clone(), proxy.clone())?;
 
-    let steamid = resolve_steamid(&store, &client, &local, &opts, progress).await?;
+    let steamid = resolve_steamid(&store, &client, &local, &opts, &line).await?;
 
     // Tier A：库清单
-    progress(&format!("[1/6] 拉取游戏库（SteamID {steamid}）……"));
+    report(&SyncProgress::pct(format!("[1/6] 拉取游戏库（SteamID {steamid}）……"), 3));
     let games = client.get_owned_games(&steamid).await.context("拉取游戏库失败")?;
     store.upsert_owned_games(&games)?;
-    progress(&format!(
+    report(&SyncProgress::bar(5));
+    line(&format!(
         "      共 {} 款（含非游戏软件；剔除见画像页）",
         games.len()
     ));
 
     // E 层：本地安装状态
-    refresh_local(&store, &local, progress)?;
+    refresh_local(&store, &local, &line)?;
+    report(&SyncProgress::bar(7));
 
     // Tier B（玩家成就）∥ Tier C（全球完成度）∥ Tier D（商店详情/标签/存储回填）：
     // 一次性领完所有待办（Tier C/D 原本要等 B 串行跑完，30 分钟的大头就在这里），
@@ -110,23 +136,26 @@ pub async fn run(
         && need_tags.is_empty()
         && need_storage.is_empty()
     {
-        progress("[3-5/6] 玩家成就 / 全球完成度 / 商店数据：已是最新");
+        line("[3-5/6] 玩家成就 / 全球完成度 / 商店数据：已是最新");
     } else {
         // 预计时间 = 三条限速域各自的墙钟下限取最大，再放宽 20% 兜 RTT 与重试
         let web_min = (todo.len() + need_global.len()) as f64 / 8.0 / 60.0;
         let api_min = need_details.len() as f64 / 36.0;
         let page_min = (need_tags.len() + need_storage.len()) as f64 / 60.0;
         let eta = (web_min.max(api_min).max(page_min) * 1.2).ceil() as u64;
-        progress(&format!(
-            "[3-5/6] 并行拉取：玩家成就 {} 款（玩过 {} 款，其余已标记跳过）· 全球完成度 {} · 详情 {} · 标签 {} · 存储回填 {}",
-            todo.len(),
-            played.len(),
-            need_global.len(),
-            need_details.len(),
-            need_tags.len(),
-            need_storage.len()
+        report(&SyncProgress::pct(
+            format!(
+                "[3-5/6] 并行拉取：玩家成就 {} 款（玩过 {} 款，其余已标记跳过）· 全球完成度 {} · 详情 {} · 标签 {} · 存储回填 {}",
+                todo.len(),
+                played.len(),
+                need_global.len(),
+                need_details.len(),
+                need_tags.len(),
+                need_storage.len()
+            ),
+            7,
         ));
-        progress(&format!(
+        line(&format!(
             "      预计网络阶段约 {} 分钟（Web API 与商店双通道并行，商店接口限速 36 次/分 + 页面 60 次/分）",
             eta
         ));
@@ -213,6 +242,8 @@ pub async fn run(
         drop(tx); // 生成者全数收尾后 recv 返回 None，消费者自然退出
 
         // 消费者（主循环）：唯一的 DB 写入方
+        let total_jobs =
+            (todo.len() + need_global.len() + need_details.len() + need_tags.len() + need_storage.len()).max(1);
         let mut c_failed = 0usize;
         let mut d_failed: Vec<u32> = Vec::new();
         let mut t_failed: Vec<u32> = Vec::new();
@@ -295,38 +326,44 @@ pub async fn run(
                 }
             }
             if processed % 20 == 0 {
-                progress(&format!(
-                    "  … 成就 {}/{} · 全球 {}/{} · 详情 {}/{} · 标签 {}/{} · 回填 {}/{}",
-                    b_done,
-                    todo.len(),
-                    c_done,
-                    need_global.len(),
-                    d_done,
-                    need_details.len(),
-                    t_done,
-                    need_tags.len(),
-                    s_done,
-                    need_storage.len()
+                report(&SyncProgress::pct(
+                    format!(
+                        "  … 成就 {}/{} · 全球 {}/{} · 详情 {}/{} · 标签 {}/{} · 回填 {}/{}",
+                        b_done,
+                        todo.len(),
+                        c_done,
+                        need_global.len(),
+                        d_done,
+                        need_details.len(),
+                        t_done,
+                        need_tags.len(),
+                        s_done,
+                        need_storage.len()
+                    ),
+                    (7.0 + 71.0 * processed as f64 / total_jobs as f64).min(78.0) as u8,
                 ));
             }
         }
-        progress(&format!(
-            "      并行阶段完成：成就 {} 款（失败 {}）· 全球 {}（失败 {}）· 详情 {}（失败 {}）· 标签 {}（失败 {}）· 回填 {}，用时 {:.1}s",
-            todo.len() - b_failed,
-            b_failed,
-            need_global.len() - c_failed,
-            c_failed,
-            need_details.len() - d_failed.len(),
-            d_failed.len(),
-            need_tags.len() - t_failed.len(),
-            t_failed.len(),
-            s_done,
-            t0.elapsed().as_secs_f32()
+        report(&SyncProgress::pct(
+            format!(
+                "      并行阶段完成：成就 {} 款（失败 {}）· 全球 {}（失败 {}）· 详情 {}（失败 {}）· 标签 {}（失败 {}）· 回填 {}，用时 {:.1}s",
+                todo.len() - b_failed,
+                b_failed,
+                need_global.len() - c_failed,
+                c_failed,
+                need_details.len() - d_failed.len(),
+                d_failed.len(),
+                need_tags.len() - t_failed.len(),
+                t_failed.len(),
+                s_done,
+                t0.elapsed().as_secs_f32()
+            ),
+            80,
         ));
 
         // 间歇性风控（429/403）补试：此时限流窗口已过去，串行小批量即可
         if !interrupted && !cancel.is_cancelled() && (!d_failed.is_empty() || !t_failed.is_empty()) {
-            progress(&format!(
+            line(&format!(
                 "  … {} 款详情 / {} 款标签失败，30 秒后补试一轮",
                 d_failed.len(),
                 t_failed.len()
@@ -373,7 +410,7 @@ pub async fn run(
                 }
                 if still > 0 {
                     tracing::error!("商店数据仍有 {still} 款未拉到——多为暂时性风控，下次同步会自动重试");
-                    progress(&format!("  … 商店数据仍有 {still} 款未拉到（下次同步自动重试）"));
+                    line(&format!("  … 商店数据仍有 {still} 款未拉到（下次同步自动重试）"));
                 }
             }
         }
@@ -387,7 +424,7 @@ pub async fn run(
             let cleared = store.clear_achievement_categories()?;
             store.meta_set("ach_cat_ver", crate::profiler::ACH_CAT_VERSION)?;
             if cleared > 0 {
-                progress(&format!(
+                line(&format!(
                     "成就分类规则升级（v{cur} → v{}）：清空 {} 条旧分类，重新在线分析",
                     crate::profiler::ACH_CAT_VERSION,
                     cleared
@@ -400,19 +437,40 @@ pub async fn run(
     } else {
         match LlmClient::from_config(cfg) {
             Ok(c) => {
-                progress(&format!("（LLM：{}，定价：{}）", c.model(), c.price_note()));
+                line(&format!("（LLM：{}，定价：{}）", c.model(), c.price_note()));
                 Some(c)
             }
             Err(e) => {
-                progress(&format!("（LLM 未启用：{e}；成就类型分析跳过，画像将仅用 tag 信号）"));
+                line(&format!("（LLM 未启用：{e}；成就类型分析跳过，画像将仅用 tag 信号）"));
                 None
             }
         }
     };
+    // Tier F 的 LLM 阶段按已处理游戏数推进进度（80→97%）：首行带总数、
+    // 随后每款一行"  [i/N]"——轻量文本解析（该行格式由 profiler 固定产出）
+    let llm_phase = std::sync::Mutex::new((0usize, 0usize)); // (total, done)
+    let llm_adapt = |s: &str| {
+        let mut st = llm_phase.lock().expect("LLM 阶段进度锁");
+        if st.0 == 0 {
+            if let Some(rest) = s.split_once("（").map(|(_, r)| r) {
+                if let Some(n) = rest.split('款').next().and_then(|x| x.trim().parse::<usize>().ok()) {
+                    st.0 = n;
+                }
+            }
+        } else if s.starts_with("  [") {
+            st.1 += 1;
+        }
+        let pct = if st.0 > 0 {
+            Some((80.0 + 17.0 * st.1 as f64 / st.0 as f64).min(97.0) as u8)
+        } else {
+            None
+        };
+        report(&SyncProgress { text: s.to_string(), pct });
+    };
     let llm_stats =
-        crate::profiler::analyze_missing(llm.as_ref(), &store, &|s: &str| progress(s)).await?;
+        crate::profiler::analyze_missing(llm.as_ref(), &store, &llm_adapt).await?;
     if llm_stats.calls > 0 {
-        progress(&format!(
+        line(&format!(
             "      类型分析：{} 款、{} 次调用，tokens {}入/{}出，费用 {}",
             llm_stats.games,
             llm_stats.calls,
@@ -426,10 +484,29 @@ pub async fn run(
     // 否则只有 CLI profile/recommend 会跑，设置页/引导勾选后永远不生效
     if let Some(llm) = llm.as_ref() {
         if cfg.agent.llm_positioning {
-            progress("（LLM 游戏定位增强：为未定位的游戏生成缓存，一游戏一次）");
-            let pos = crate::profiler::llm_position_library(llm, &store, &|s: &str| progress(s)).await?;
+            report(&SyncProgress::pct("（LLM 游戏定位增强：为未定位的游戏生成缓存，一游戏一次）", 97));
+            let pos_phase = std::sync::Mutex::new((0usize, 0usize));
+            let pos_adapt = |s: &str| {
+                let mut st = pos_phase.lock().expect("定位阶段进度锁");
+                if st.0 == 0 {
+                    if let Some(rest) = s.split_once("（").map(|(_, r)| r) {
+                        if let Some(n) = rest.split('款').next().and_then(|x| x.trim().parse::<usize>().ok()) {
+                            st.0 = n;
+                        }
+                    }
+                } else if s.starts_with("  [") {
+                    st.1 += 1;
+                }
+                let pct = if st.0 > 0 {
+                    Some((97.0 + 2.0 * st.1 as f64 / st.0 as f64).min(99.0) as u8)
+                } else {
+                    None
+                };
+                report(&SyncProgress { text: s.to_string(), pct });
+            };
+            let pos = crate::profiler::llm_position_library(llm, &store, &pos_adapt).await?;
             if pos.calls > 0 {
-                progress(&format!(
+                line(&format!(
                     "      游戏定位：{} 款、{} 次调用，费用 {}",
                     pos.games,
                     pos.calls,
@@ -444,7 +521,7 @@ pub async fn run(
 
     if let Ok((calls, pin, pout, cost)) = store.usage_summary() {
         if calls > 0 {
-            progress(&format!(
+            line(&format!(
                 "LLM 累计用量：{calls} 次调用，{pin} 入 / {pout} 出 tokens，累计费用 {}",
                 cost.map(|c| format!("¥{c:.4}")).unwrap_or_else(|| "部分调用未配置价格".into())
             ));
@@ -452,14 +529,17 @@ pub async fn run(
     }
 
     if interrupted {
-        progress(&format!("已中断：成就 {}/{}（已拉取部分均已入库）", b_done, todo.len()));
+        line(&format!("已中断：成就 {}/{}（已拉取部分均已入库）", b_done, todo.len()));
     } else {
-        progress(&format!(
-            "同步完成：成就 {} 款、失败 {} 款，用时 {:.1}s；数据库 {}",
-            todo.len() - b_failed,
-            b_failed,
-            t0.elapsed().as_secs_f32(),
-            db.display()
+        report(&SyncProgress::pct(
+            format!(
+                "同步完成：成就 {} 款、失败 {} 款，用时 {:.1}s；数据库 {}",
+                todo.len() - b_failed,
+                b_failed,
+                t0.elapsed().as_secs_f32(),
+                db.display()
+            ),
+            100,
         ));
     }
     Ok(())
@@ -528,13 +608,14 @@ pub async fn repair(
     db: &Path,
     cfg: &Config,
     cancel: CancellationToken,
-    progress: &(dyn Fn(&str) + Send + Sync),
+    report: &(dyn Fn(&SyncProgress) + Send + Sync),
 ) -> Result<()> {
+    let line = |text: &str| report(&SyncProgress::line(text));
     let store = Store::open(db).context("打开数据库失败")?;
 
     // 本地安装状态顺带刷新（E 层，零网络成本）
     if let Ok(steam_dir) = steam_local::resolve_steam_dir(cfg) {
-        refresh_local(&store, &SteamLocal::open(&steam_dir), progress)?;
+        refresh_local(&store, &SteamLocal::open(&steam_dir), &line)?;
     }
 
     let anomalies = crate::profiler::detect_anomalies(&store, cfg)?;
@@ -555,13 +636,13 @@ pub async fn repair(
         .collect();
     let judge_only = anomalies.len() - need_ach.len() - need_detail.len();
     if need_ach.is_empty() && need_detail.is_empty() {
-        progress(&format!(
+        line(&format!(
             "没有可自动修复的数据异常（{} 项为判断类，请用列表中的手动标注处理）",
             judge_only
         ));
         return Ok(());
     }
-    progress(&format!(
+    line(&format!(
         "待修复：成就 {} 款、商店详情 {} 款（另有判断类 {} 项需手动标注）",
         need_ach.len(),
         need_detail.len(),
@@ -591,7 +672,7 @@ pub async fn repair(
     // ① 成就重拉（顺带全球完成度）
     for (i, app_id) in need_ach.iter().enumerate() {
         if cancel.is_cancelled() {
-            progress("（已中断：已修复部分均已入库）");
+            line("（已中断：已修复部分均已入库）");
             break;
         }
         let name = names.get(app_id).cloned().unwrap_or_else(|| format!("app {app_id}"));
@@ -602,18 +683,18 @@ pub async fn repair(
                     store.upsert_global_achievements(*app_id, &rows)?;
                 }
                 fixed += 1;
-                progress(&format!("  [{}] {}：{} 项成就已补齐", i + 1, name, achs.len()));
+                line(&format!("  [{}] {}：{} 项成就已补齐", i + 1, name, achs.len()));
             }
             Ok(None) => {
                 // Steam 明确说无成就/不可用：记跳过 + 忽略该游戏的 no_ach 提示（防修复死循环）
                 store.mark_skipped(*app_id, "无成就或不可用")?;
                 let _ = store.set_override(*app_id, "anomaly_done", "done");
                 fixed += 1;
-                progress(&format!("  [{}] {}：确认无成就（Steam 返回），不再提示", i + 1, name));
+                line(&format!("  [{}] {}：确认无成就（Steam 返回），不再提示", i + 1, name));
             }
             Err(e) => {
                 still_failed += 1;
-                progress(&format!("  [{}] {}：仍失败（{e}）", i + 1, name));
+                line(&format!("  [{}] {}：仍失败（{e}）", i + 1, name));
             }
         }
     }
@@ -638,7 +719,7 @@ pub async fn repair(
                         }
                     }
                     fixed += 1;
-                    progress(&format!("  [{}] {}：商店详情已补齐", i + 1, name));
+                    line(&format!("  [{}] {}：商店详情已补齐", i + 1, name));
                 }
                 Ok(None) => {
                     store.upsert_app_detail(
@@ -646,17 +727,17 @@ pub async fn repair(
                         &AppDetail { app_type: "unknown".into(), genres: vec![], categories: vec![], storage_gb: None },
                     )?;
                     still_failed += 1;
-                    progress(&format!("  [{}] {}：商店确认不可用（下架/合集包），维持剔除", i + 1, name));
+                    line(&format!("  [{}] {}：商店确认不可用（下架/合集包），维持剔除", i + 1, name));
                 }
                 Err(e) => {
                     still_failed += 1;
-                    progress(&format!("  [{}] {}：仍失败（{e}）", i + 1, name));
+                    line(&format!("  [{}] {}：仍失败（{e}）", i + 1, name));
                 }
             }
         }
     }
 
-    progress(&format!(
+    line(&format!(
         "修复完成：成功 {fixed} 款、仍失败 {still_failed} 款{}",
         if judge_only > 0 { format!("；判断类 {judge_only} 项请手动标注") } else { String::new() }
     ));

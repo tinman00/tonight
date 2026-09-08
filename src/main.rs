@@ -100,9 +100,7 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     align_cwd_to_exe();
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    init_tracing();
     dotenvy::dotenv().ok();
 
     let cli = Cli::parse();
@@ -121,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
                 &cfg,
                 sync::SyncOptions { steamid, vanity, local_only, skip_llm },
                 cancel,
-                &|s: &str| println!("{s}"),
+                &|p: &sync::SyncProgress| println!("{}", p.text),
             )
             .await
         }
@@ -172,6 +170,73 @@ fn align_cwd_to_exe() {
             }
         }
     }
+}
+
+/// 日志初始化（v0.48）：stdout 照旧 + 追加写 data/logs/tonight.log（发行包用户排障用，
+/// README Troubleshooting 指向该文件）。文件超过 1MB 轮转为 tonight.old（只保留一代）；
+/// 文件打不开时静默退化为仅 stdout——日志层绝不能拖垮主程序。
+fn init_tracing() {
+    use std::io::Write as _;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    struct LogFile(PathBuf);
+    struct LogWriter(Option<std::fs::File>);
+    struct TeeWriter { file: LogWriter, out: std::io::Stdout }
+    struct Tee(LogFile);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match &mut self.0 {
+                Some(f) => f.write(buf),
+                None => Ok(buf.len()),
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            match &mut self.0 {
+                Some(f) => f.flush(),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl std::io::Write for TeeWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.file.write(buf);
+            let _ = self.out.write(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            let _ = self.file.flush();
+            self.out.flush()
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Tee {
+        type Writer = TeeWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            // 轮转检查：rename 失败（占用等）不阻断，下次事件再试
+            if let Ok(md) = std::fs::metadata(&self.0 .0) {
+                if md.len() > 1_000_000 {
+                    let _ = std::fs::rename(&self.0 .0, self.0 .0.with_extension("old"));
+                }
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.0 .0)
+                .ok();
+            TeeWriter { file: LogWriter(file), out: std::io::stdout() }
+        }
+    }
+
+    let log_path = PathBuf::from("data/logs/tonight.log");
+    let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(Path::new(".")));
+    // 启动即 touch：零事件的干净运行也保证文件存在（README 排障指引指向它）
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path);
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(Tee(LogFile(log_path)))
+        .init();
 }
 
 async fn run_profile(

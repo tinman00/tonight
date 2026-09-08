@@ -119,23 +119,23 @@ impl AnalyzeStats {
     }
 }
 
-/// 对一个游戏的全部成就做类型分析并落库。不可表意者直接 other（不送模型）；
-/// 可表意成就不足 3 条或不足三成 → 整组 other 落库（作为“已处理”标记，下次同步不再调用）。
-pub async fn analyze_game(
+/// 纯 LLM 侧的类型分析（不碰 DB，可在并行任务中运行）。
+/// 返回 (分类行, 每次调用的用量记录)；分类行为 None 表示 LLM 调用失败——
+/// 不落库、下次同步重试。不可表意成就不足 3 条或不足三成 → 整组 other 落库
+/// （作为"已处理"标记，下次同步不再调用）。
+async fn analyze_names(
     llm: &LlmClient,
-    store: &Store,
     app_id: u32,
     names: &[String],
-) -> Result<AnalyzeStats> {
-    let mut stats = AnalyzeStats { games: 1, ..Default::default() };
+    global_map: &HashMap<String, f32>,
+) -> (Option<Vec<(String, AchievementCategory)>>, Vec<(String, u64, u64, Option<f64>)>) {
     let mut cats: BTreeMap<String, AchievementCategory> =
         names.iter().map(|n| (n.clone(), AchievementCategory::Other)).collect();
+    let mut usage: Vec<(String, u64, u64, Option<f64>)> = Vec::new();
     let expressive: Vec<&String> = names.iter().filter(|n| is_expressive(n)).collect();
 
     if expressive.len() >= 3 && expressive.len() * 10 >= names.len() * 3 {
         // 全球达成率注入：终点成就的分布信号（教程 >60%、主线终点 15–50%、彩蛋 <10%）
-        let global_map: HashMap<String, f32> =
-            store.global_achievements(app_id)?.into_iter().collect();
         let pct = |n: &str| -> String {
             global_map.get(n).map(|p| format!("（全球 {p:.0}%）")).unwrap_or_default()
         };
@@ -146,18 +146,17 @@ pub async fn analyze_game(
                 "成就 api_name 列表（每行一个，附全球达成率）：\n{listing}\n\n请输出覆盖以上全部 {} 个名字的 JSON 对象。",
                 requested.len()
             );
-            let out = llm
+            let out = match llm
                 .chat(&[ChatMessage::system(TYPE_SYSTEM), ChatMessage::user(ask)], 0.1, true, 8192)
-                .await;
-            let out = match out {
+                .await
+            {
                 Ok(o) => o,
                 Err(e) => {
                     tracing::warn!("app {app_id} 成就类型分析失败（跳过，下次同步重试）: {e}");
-                    return Ok(stats);
+                    return (None, usage);
                 }
             };
-            stats.add_call(&out.model, out.usage.prompt_tokens, out.usage.completion_tokens, out.cost_cny);
-            store.record_usage("ach_type_analysis", &out.model, out.usage.prompt_tokens, out.usage.completion_tokens, out.cost_cny)?;
+            usage.push((out.model, out.usage.prompt_tokens, out.usage.completion_tokens, out.cost_cny));
             let (mut map, ok) = parse_type_response(&out.content, &requested);
             if !ok {
                 let retry = format!(
@@ -167,8 +166,7 @@ pub async fn analyze_game(
                     .chat(&[ChatMessage::system(TYPE_SYSTEM), ChatMessage::user(retry)], 0.1, true, 8192)
                     .await;
                 if let Ok(o2) = out2 {
-                    stats.add_call(&o2.model, o2.usage.prompt_tokens, o2.usage.completion_tokens, o2.cost_cny);
-                    store.record_usage("ach_type_analysis", &o2.model, o2.usage.prompt_tokens, o2.usage.completion_tokens, o2.cost_cny)?;
+                    usage.push((o2.model, o2.usage.prompt_tokens, o2.usage.completion_tokens, o2.cost_cny));
                     let (m2, _) = parse_type_response(&o2.content, &requested);
                     map = m2;
                 }
@@ -178,8 +176,27 @@ pub async fn analyze_game(
             }
         }
     }
-    let rows: Vec<(String, AchievementCategory)> = cats.into_iter().collect();
-    store.upsert_achievement_categories(app_id, &rows)?;
+    (Some(cats.into_iter().collect()), usage)
+}
+
+/// 对一个游戏的全部成就做类型分析并落库（单游戏入口：读库 → LLM → 写库）。
+pub async fn analyze_game(
+    llm: &LlmClient,
+    store: &Store,
+    app_id: u32,
+    names: &[String],
+) -> Result<AnalyzeStats> {
+    let mut stats = AnalyzeStats { games: 1, ..Default::default() };
+    let global_map: HashMap<String, f32> =
+        store.global_achievements(app_id)?.into_iter().collect();
+    let (rows, usage) = analyze_names(llm, app_id, names, &global_map).await;
+    for (model, pin, pout, cost) in &usage {
+        stats.add_call(model, *pin, *pout, *cost);
+        store.record_usage("ach_type_analysis", model, *pin, *pout, *cost)?;
+    }
+    if let Some(rows) = rows {
+        store.upsert_achievement_categories(app_id, &rows)?;
+    }
     Ok(stats)
 }
 
@@ -210,11 +227,13 @@ pub async fn analyze_missing(
         return Ok(AnalyzeStats::default());
     };
     if todo.is_empty() {
+        progress("[6/6] 成就类型分析：全部缓存命中，无需重新分析");
         return Ok(AnalyzeStats::default());
     }
-    progress(&format!("[6/6] 成就类型分析（{} 款，缓存命中跳过）：", todo.len()));
-    let mut total = AnalyzeStats::default();
-    for (i, g) in todo.iter().enumerate() {
+    progress(&format!("[6/6] 成就类型分析（{} 款，缓存命中跳过，4 路并行）：", todo.len()));
+    // 预取每款游戏的名字与全球达成率：DB 读集中在主循环，并行任务里只做 LLM 调用
+    let mut jobs: Vec<(u32, String, Vec<String>, HashMap<String, f32>)> = Vec::new();
+    for g in &todo {
         // 名称源：玩家成就（玩过）→ 全球成就名（候选）
         let mut names: Vec<String> =
             store.achievements(g.app_id)?.into_iter().map(|a| a.api_name).collect();
@@ -224,9 +243,40 @@ pub async fn analyze_missing(
         if names.is_empty() {
             continue;
         }
-        let stats = analyze_game(llm, store, g.app_id, &names).await?;
+        let global_map: HashMap<String, f32> =
+            store.global_achievements(g.app_id)?.into_iter().collect();
+        jobs.push((g.app_id, g.name.clone(), names, global_map));
+    }
+    // LLM 并行（chat 自带 429 退避；完成顺序不定，进度行按完成序输出）
+    const CONCURRENCY: usize = 4;
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(u32, String, Option<Vec<(String, AchievementCategory)>>, Vec<(String, u64, u64, Option<f64>)>)>(16);
+    for (app_id, name, names, global_map) in jobs {
+        let llm = LlmClient::clone(llm);
+        let sem = sem.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.expect("信号量未关闭");
+            let (rows, usage) = analyze_names(&llm, app_id, &names, &global_map).await;
+            let _ = tx.send((app_id, name, rows, usage)).await;
+        });
+    }
+    drop(tx);
+    // 单消费者串行写库（rusqlite 连接不跨任务共享）
+    let mut total = AnalyzeStats::default();
+    let mut done = 0usize;
+    while let Some((app_id, name, rows, usage)) = rx.recv().await {
+        done += 1;
+        let mut stats = AnalyzeStats { games: 1, ..Default::default() };
+        for (model, pin, pout, cost) in &usage {
+            stats.add_call(model, *pin, *pout, *cost);
+            store.record_usage("ach_type_analysis", model, *pin, *pout, *cost)?;
+        }
+        if let Some(rows) = rows {
+            store.upsert_achievement_categories(app_id, &rows)?;
+        }
         total.merge(stats);
-        progress(&format!("  [{:>3}/{}] {}", i + 1, todo.len(), g.name));
+        progress(&format!("  [{:>3}/{}] {}", done, todo.len(), name));
     }
     Ok(total)
 }

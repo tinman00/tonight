@@ -493,34 +493,81 @@ fn merge_drafts(drafts: Vec<CardDraft>, facts: &[GameFacts], source: &'static st
 
 /// 卡片生成：schema 校验 → 带错误重试 1 次 → 仍失败返回 Err（调用方走模板兜底）。
 /// 返回 (卡片, 用量增量)。
+/// 单次流式卡片调用（v0.49）：增量文本里数已完成的卡（每张卡恰有一个 "app_id" 字段），
+/// 变化时 trace「推荐语 x/total」——对话页首屏生成与 CTA 换批共用此路径，逐张进度实时可见；
+/// total=0 时不报逐张（探索位单卡场景）。完成后 trace 本调用用量（工具调用可视化）并入库。
+/// 返回完整 content 文本；stats 为 (调用数, 入 tokens, 出 tokens, 费用) 增量累计。
+async fn stream_cards_once(
+    llm: &LlmClient,
+    store: &Store,
+    purpose: &str,
+    msgs: &[ChatMessage],
+    temperature: f32,
+    budget: u32,
+    total: usize,
+    trace: &(dyn Fn(&str) + Send + Sync),
+    stats: &mut (u32, u64, u64, Option<f64>),
+) -> Result<String> {
+    let acc = std::sync::Mutex::new(String::new());
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let out = llm
+        .chat_stream(msgs, temperature, true, budget, &|delta: &str| {
+            let mut a = acc.lock().expect("卡片进度锁");
+            a.push_str(delta);
+            let n = a.matches("\"app_id\"").count();
+            let d = done.load(std::sync::atomic::Ordering::Relaxed);
+            if n > d && total > 0 {
+                // chunk 合包时可能一次跳多张，逐张补报
+                for k in (d + 1)..=n.min(total) {
+                    trace(&format!("推荐语 {k}/{total}"));
+                }
+                done.store(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+        .await?;
+    stats.0 += 1;
+    stats.1 += out.usage.prompt_tokens;
+    stats.2 += out.usage.completion_tokens;
+    stats.3 = match (stats.3, out.cost_cny) {
+        (Some(a), Some(b)) => Some(a + b),
+        (None, b) => b,
+        (a, None) => a,
+    };
+    trace(&format!(
+        "LLM 调用（{purpose}）：{}入/{}出{}",
+        out.usage.prompt_tokens,
+        out.usage.completion_tokens,
+        out.cost_cny.map(|c| format!(" · ¥{c:.4}")).unwrap_or_default()
+    ));
+    store.record_usage(purpose, &out.model, out.usage.prompt_tokens, out.usage.completion_tokens, out.cost_cny)?;
+    Ok(out.content)
+}
+
 async fn generate_cards(
     llm: &LlmClient,
     store: &Store,
     digest: &str,
     intent_desc: &str,
     facts: &[GameFacts],
-) -> Result<(Vec<RecommendationCard>, (u32, u64, u64))> {
-    let mut stats = (0u32, 0u64, 0u64);
+    trace: &(dyn Fn(&str) + Send + Sync),
+) -> Result<(Vec<RecommendationCard>, (u32, u64, u64, Option<f64>))> {
+    let mut stats = (0u32, 0u64, 0u64, None);
+    let total = facts.len().min(3); // 提示词约定恰好 3 张（候选不足则全出）
+    trace(&format!("正在为挑选出的 {} 款候选写推荐语…", total));
     let sys = ChatMessage::system(CARD_SYSTEM);
     let ask = ChatMessage::user(card_user_prompt(digest, intent_desc, facts));
-    let out = llm.chat(&[sys.clone(), ask.clone()], 0.4, true, 4096).await?;
-    stats.0 += 1;
-    stats.1 += out.usage.prompt_tokens;
-    stats.2 += out.usage.completion_tokens;
-    store.record_usage("cards", &out.model, out.usage.prompt_tokens, out.usage.completion_tokens, out.cost_cny)?;
-    match parse_cards_response(&out.content, facts) {
+    let content =
+        stream_cards_once(llm, store, "cards", &[sys.clone(), ask.clone()], 0.4, 4096, total, trace, &mut stats).await?;
+    match parse_cards_response(&content, facts) {
         Ok(drafts) => Ok((merge_drafts(drafts, facts, "llm"), stats)),
         Err(err) => {
             tracing::warn!("卡片校验失败，带错误重试: {err}");
             let retry = ChatMessage::user(format!("上一次输出校验失败：{err}。请修正后重新输出完整 JSON。"));
-            let prev = ChatMessage { role: "assistant", content: out.content.clone() };
-            let out2 = llm.chat(&[sys, ask, prev, retry], 0.2, true, 4096).await?;
-            stats.0 += 1;
-            stats.1 += out2.usage.prompt_tokens;
-            stats.2 += out2.usage.completion_tokens;
-            store.record_usage("cards", &out2.model, out2.usage.prompt_tokens, out2.usage.completion_tokens, out2.cost_cny)?;
+            let prev = ChatMessage { role: "assistant", content };
+            let content2 =
+                stream_cards_once(llm, store, "cards", &[sys, ask, prev, retry], 0.2, 4096, total, trace, &mut stats).await?;
             let drafts =
-                parse_cards_response(&out2.content, facts).map_err(|e| anyhow::anyhow!("重试后仍校验失败: {e}"))?;
+                parse_cards_response(&content2, facts).map_err(|e| anyhow::anyhow!("重试后仍校验失败: {e}"))?;
             Ok((merge_drafts(drafts, facts, "llm(retry)"), stats))
         }
     }
@@ -559,27 +606,23 @@ async fn generate_explore_cards(
     digest: &str,
     session_cap: u32,
     explore_facts: &[GameFacts],
-) -> Result<(Vec<RecommendationCard>, (u32, u64, u64))> {
-    let mut stats = (0u32, 0u64, 0u64);
+    trace: &(dyn Fn(&str) + Send + Sync),
+) -> Result<(Vec<RecommendationCard>, (u32, u64, u64, Option<f64>))> {
+    let mut stats = (0u32, 0u64, 0u64, None);
+    trace("正在为探索位写一张尝鲜卡…");
     let sys = ChatMessage::system(EXPLORE_CARD_SYSTEM);
     let ask = ChatMessage::user(explore_card_prompt(digest, session_cap, explore_facts));
-    let out = llm.chat(&[sys.clone(), ask.clone()], 0.7, true, 2048).await?;
-    stats.0 += 1;
-    stats.1 += out.usage.prompt_tokens;
-    stats.2 += out.usage.completion_tokens;
-    store.record_usage("explore_card", &out.model, out.usage.prompt_tokens, out.usage.completion_tokens, out.cost_cny)?;
-    let drafts = match parse_cards_response(&out.content, explore_facts) {
+    let content =
+        stream_cards_once(llm, store, "explore_card", &[sys.clone(), ask.clone()], 0.7, 2048, 0, trace, &mut stats).await?;
+    let drafts = match parse_cards_response(&content, explore_facts) {
         Ok(d) => d,
         Err(err) => {
             tracing::warn!("探索位卡校验失败，带错误重试: {err}");
             let retry = ChatMessage::user(format!("上一次输出校验失败：{err}。请修正后重新输出完整 JSON。"));
-            let prev = ChatMessage { role: "assistant", content: out.content.clone() };
-            let out2 = llm.chat(&[sys, ask, prev, retry], 0.5, true, 2048).await?;
-            stats.0 += 1;
-            stats.1 += out2.usage.prompt_tokens;
-            stats.2 += out2.usage.completion_tokens;
-            store.record_usage("explore_card", &out2.model, out2.usage.prompt_tokens, out2.usage.completion_tokens, out2.cost_cny)?;
-            parse_cards_response(&out2.content, explore_facts).map_err(|e| anyhow::anyhow!("重试后仍校验失败: {e}"))?
+            let prev = ChatMessage { role: "assistant", content };
+            let content2 =
+                stream_cards_once(llm, store, "explore_card", &[sys, ask, prev, retry], 0.5, 2048, 0, trace, &mut stats).await?;
+            parse_cards_response(&content2, explore_facts).map_err(|e| anyhow::anyhow!("重试后仍校验失败: {e}"))?
         }
     };
     Ok((merge_drafts(drafts, explore_facts, "llm(explore)"), stats))
@@ -670,6 +713,8 @@ pub struct TurnResult {
     pub llm_calls: u32,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// 本轮总费用（未计价模型为 None；done 事件透传给前端展示）
+    pub cost_cny: Option<f64>,
     /// 本轮无候选且带品类条件、尚未放宽 → 前端 CTA 提供"放宽条件"入口
     pub relaxable: bool,
     /// 当前轨道已放宽（无候选且已放宽 → "整个库都看完了"）
@@ -730,6 +775,14 @@ pub async fn handle_turn(
 ) -> Result<TurnResult> {
     budget_check(store, cfg)?;
     let (mut calls, mut ptoks, mut ctoks) = (0u32, 0u64, 0u64);
+    let mut cost: Option<f64> = None;
+    let add_cost = |cost: &mut Option<f64>, c: Option<f64>| {
+        *cost = match (*cost, c) {
+            (Some(a), Some(b)) => Some(a + b),
+            (None, b) => b,
+            (a, None) => a,
+        };
+    };
 
     // 轮间启动检测：前端异步上报 launch（steam:// 协议跳转不打断对话），这里查事件表。
     // 有新启动 → 用户找到了想玩的，换批计数与探索模式一并清零。
@@ -789,6 +842,7 @@ pub async fn handle_turn(
         } else {
             format!("对话历史：\n{hist}\n---\n用户最新消息：{input}")
         };
+        trace("正在理解你想玩什么…");
         let out = llm
             .chat(
                 &[ChatMessage::system(intent_system(&popular.join("、"))), ChatMessage::user(ask)],
@@ -801,6 +855,13 @@ pub async fn handle_turn(
         calls += 1;
         ptoks += out.usage.prompt_tokens;
         ctoks += out.usage.completion_tokens;
+        add_cost(&mut cost, out.cost_cny);
+        trace(&format!(
+            "LLM 调用（意图解析）：{}入/{}出{}",
+            out.usage.prompt_tokens,
+            out.usage.completion_tokens,
+            out.cost_cny.map(|c| format!(" · ¥{c:.4}")).unwrap_or_default()
+        ));
         store.record_usage("intent", &out.model, out.usage.prompt_tokens, out.usage.completion_tokens, out.cost_cny)?;
         match parse_intent_response(&out.content) {
             Some(f) => {
@@ -878,6 +939,7 @@ pub async fn handle_turn(
             llm_calls: calls,
             prompt_tokens: ptoks,
             completion_tokens: ctoks,
+            cost_cny: cost,
             relaxable,
             relaxed,
         });
@@ -893,11 +955,12 @@ pub async fn handle_turn(
         .max_session_min
         .unwrap_or(profile.behavior.typical_session_min)
         .min(profile.behavior.typical_session_min.max(30));
-    let cards = match generate_cards(llm, store, digest, &intent_desc, &facts).await {
+    let cards = match generate_cards(llm, store, digest, &intent_desc, &facts, trace).await {
         Ok((c, s)) => {
             calls += s.0;
             ptoks += s.1;
             ctoks += s.2;
+            add_cost(&mut cost, s.3);
             c
         }
         Err(e) => {
@@ -914,11 +977,12 @@ pub async fn handle_turn(
         .collect();
     let mut cards = cards;
     if !missing_explore.is_empty() {
-        match generate_explore_cards(llm, store, digest, session_cap, &missing_explore).await {
+        match generate_explore_cards(llm, store, digest, session_cap, &missing_explore, trace).await {
             Ok((mut ec, s)) => {
                 calls += s.0;
                 ptoks += s.1;
                 ctoks += s.2;
+                add_cost(&mut cost, s.3);
                 trace("探索位未被主批选中 → 探索位专项 LLM 生成补齐");
                 cards.append(&mut ec);
             }
@@ -951,6 +1015,7 @@ pub async fn handle_turn(
         llm_calls: calls,
         prompt_tokens: ptoks,
         completion_tokens: ctoks,
+        cost_cny: cost,
         relaxable: false,
         relaxed,
     })

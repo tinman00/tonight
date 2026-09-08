@@ -30,7 +30,10 @@ fn intent_system(popular_tags: &str) -> String {
          严禁因此推断任何品类或心境——有大段时间不等于想玩剧情向；\n\
          3. 心境描述（轻松/想放松/动脑子/刺激/治愈）放 mood，不进 tags；\n\
          4. 组合品类词要拆开：如“回合制策略”拆成 [回合制, 策略]（用户库标签是分开的，\
-         组合词整词匹配会全部落空）；\n\
+         组合词整词匹配会全部落空）；\
+         4b. tags/exclude_tags/remember_exclude 优先从「用户库常见品类」里选**原词**：\
+         用户说“肉鸽”而库里的标签是「类 Rogue」时，写 类 Rogue；说“银河恶魔城”而库里是\
+         「类银河战士恶魔城」时，写 类银河战士恶魔城——同义词整词匹配不上库标签；\n\
          5. 不确定的字段一律留空：tags 为空数组是合法且常见的值，绝不要为了“填点什么”而猜测品类；\n\
          6. “随便玩/不知道/帮我挑/都行/来点”这类没有具体指向的请求：全部字段留空（tags=[]、\
          max_session_min=null、mood=null），交给全库推荐；\n\
@@ -719,6 +722,8 @@ pub struct TurnResult {
     pub relaxable: bool,
     /// 当前轨道已放宽（无候选且已放宽 → "整个库都看完了"）
     pub relaxed: bool,
+    /// 候选池本批已见底（再换批必为空）→ 轨道末尾 CTA 直接显示放宽/尽头而非"换一批"
+    pub exhausted: bool,
 }
 
 /// 会话存档追加（R5）：data/sessions/session-<id>.json，读-改-写。
@@ -942,6 +947,7 @@ pub async fn handle_turn(
             cost_cny: cost,
             relaxable,
             relaxed,
+            exhausted: true, // 空候选本身就是见底
         });
     }
 
@@ -1007,6 +1013,8 @@ pub async fn handle_turn(
         .collect::<Vec<_>>()
         .join("；");
     state.history.push((input.to_string(), summary));
+    // 本批把候选池发完（如品类过滤只剩 1 款）→ 末尾 CTA 直接给放宽/尽头，不再"换一批"
+    let exhausted_pool = cards.len() >= cands.len();
 
     Ok(TurnResult {
         intent_desc,
@@ -1016,8 +1024,10 @@ pub async fn handle_turn(
         prompt_tokens: ptoks,
         completion_tokens: ctoks,
         cost_cny: cost,
-        relaxable: false,
+        // 见底且带品类条件未放宽 → 前端末尾 CTA 显示「放宽条件」（与空候选同语义）
+        relaxable: exhausted_pool && !relaxed && !intent.tags.is_empty(),
         relaxed,
+        exhausted: exhausted_pool,
     })
 }
 

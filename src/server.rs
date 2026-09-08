@@ -1433,6 +1433,7 @@ async fn api_ask(
                     "empty": r.cards.is_empty(),
                     "relaxable": r.relaxable,   // 无候选且带品类条件、未放宽 → 前端提供「放宽条件」CTA
                     "relaxed": r.relaxed,       // 轨道已放宽 → 尽头提示"整个库都看完了"
+                    "exhausted": r.exhausted,   // 本批见底 → 末尾 CTA 直接显示放宽/尽头而非"换一批"
                 }));
                 send(
                     "done",

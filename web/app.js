@@ -322,8 +322,14 @@ function rebuildTrack(t, instant) {
         html = `<div class="slide cta-slide only"><button class="cta">没有符合条件的候选<br><span class="cta-ic">↻</span> 再试一次</button></div>`;
       }
     } else {
-      // 轨道末尾的「换一批」CTA 卡：滑到它即自然发起下一批请求
-      html += `<div class="slide cta-slide"><button class="cta" title="拉取下一批推荐">换一批<br><span class="cta-ic">↻</span></button></div>`;
+      // 轨道末尾 CTA：池子本批见底 → 直接给放宽/尽头；还有余量 → "换一批"
+      if (t.exhausted && t.relaxable) {
+        html += `<div class="slide cta-slide"><button class="cta relax">符合条件的都看完了<br><span class="cta-ic">⤢</span> 放宽条件，看看其他游戏</button></div>`;
+      } else if (t.exhausted && t.relaxed) {
+        html += `<div class="slide cta-slide"><button class="cta dead">整个库都看完了<br><span class="cta-ic">🎲</span> 换个说法再试试</button></div>`;
+      } else {
+        html += `<div class="slide cta-slide"><button class="cta" title="拉取下一批推荐">换一批<br><span class="cta-ic">↻</span></button></div>`;
+      }
     }
   }
   t.track.innerHTML = html;
@@ -382,6 +388,8 @@ function position(t, instant) {
         : t.lastEmpty
           ? (t.relaxable ? "符合条件的都看完了 · 点 CTA 放宽条件"
             : t.relaxed ? "整个库都看完了 · 换个说法试试" : "没有符合条件的候选 · 点 CTA 卡重试")
+          : t.exhausted && t.relaxable ? "符合条件的都看完了 · 点 CTA 放宽条件"
+          : t.exhausted && t.relaxed ? "整个库都看完了 · 换个说法试试"
           : "已看完本批推荐 · CTA 卡可再来一批")
       : `第 ${t.flat + 1} 张 · 共 ${total} 张`;
 }
@@ -419,6 +427,7 @@ async function streamAsk(message, t) {
       t.generating = false;
       t.relaxable = !!ev.payload.relaxable;
       t.relaxed = !!ev.payload.relaxed;
+      t.exhausted = !!ev.payload.exhausted;
       if (ev.payload.empty) {
         t.lastEmpty = true;
         rebuildTrack(t, true); // 原位显示 CTA（放宽 / 尽头 / 重试 三态）
@@ -473,6 +482,7 @@ function newTurnPage(text) {
     batches: [], flat: 0, loading: false,
     generating: true, // 首批生成中：轨道显示占位卡
     lastEmpty: false,
+    exhausted: false,  // 本批见底：末尾 CTA 显示放宽/尽头而非"换一批"
     seen: new Set(),     // 本轮到过中心位的卡（换批时未启动的批量上报 skip）
     launched: new Set(), // 本轮启动过的卡（不参与 skip）
   };

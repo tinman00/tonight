@@ -238,6 +238,12 @@
       <p>最后一步：抓取游戏库并生成玩家画像（首次视库大小约 3–15 分钟，进度里会给出更准的预估；之后增量秒级）。</p>
       <p class="ob-warn">⚠ 需要你的 Steam 资料对公众可见：Steam 个人资料 → 隐私设置，
          把「我的资料」与「游戏详情」都设为「公开」，否则 Steam API 会拒绝查询（403）。</p>
+      <p class="ob-warn"><b>⚠ 关于「通关 / 已完成」判定，请务必了解：</b>Steam <b>没有官方的游戏完成进度
+         或通关记录</b>（ 只有总时长与成就）。本工具只能<b>借助成就辅助推断</b>完成度——推断
+         <b>很可能出错</b>：成就党可能被高估、通关但不追成就的游戏会被漏判成"弃坑"。
+         同步完成后，请到「游戏库存」页核对你的游戏：点击卡片左上角的<b>深度角标即可手动标注</b>
+         （已完成 / 暂离等），<b>手动标注永远优先于自动判定</b>；库存页也会列出系统自己拿不准、
+         建议你过目的游戏。标注过的游戏在后续推荐中按你的判断为准。</p>
       <div class="field"><label>SteamID64${local ? `（检测到本机账号：${esc(local.persona_name || local.steamid)}）` : "（留空自动检测本机登录的 Steam）"}</label>
         <input id="ob-steamid" class="ob-input" value="${esc(local ? local.steamid : "")}" placeholder="17 位 SteamID64"></div>
       <div class="field"><label>下载带宽参考（Mbps，用于估算"未安装"游戏的下载时长）</label>

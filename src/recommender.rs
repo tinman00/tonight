@@ -285,6 +285,44 @@ fn motivation_match(p: &BartleAxes, g: &[f64; 4]) -> f64 {
     (1.0 - dist / 4.0).clamp(0.0, 1.0)
 }
 
+/// 品类同义组（小写、去空格/连字符后匹配）：俗名 ↔ 官方词形互认。
+/// 意图解析的 LLM 常把「类 Rogue」说成「肉鸽」、把「类银河战士恶魔城」说成「银河恶魔城」——
+/// 没有 同义组时这些口语词永远匹配不上库内官方标签。
+const TAG_SYNONYM_GROUPS: &[&[&str]] = &[
+    &["肉鸽", "rogue", "roguelike", "roguelite"],
+    &["银河恶魔城", "银河战士恶魔城", "银河城", "metroidvania"],
+    &["类魂", "魂系", "魂类", "souls", "soulslike"],
+    &["丧尸", "僵尸"],
+    &["第一人称射击", "fps", "射击"],
+    &["moba", "多人在线战术竞技"],
+    &["农场", "种田", "农耕"],
+    &["赛车", "竞速"],
+];
+
+fn norm_tag(s: &str) -> String {
+    s.to_lowercase().replace([' ', '\u{3000}', '-'], "")
+}
+
+/// 意图标签与品味键匹配：小写归一后的双向 contains + 同义组展开
+/// （意图"肉鸽"命中标签"类 Rogue"；意图"Rogue"命中"类 Rogue"；意图"牌组构建"命中"牌组构建式类 Rogue"）
+pub fn tags_match(intent_tags: &[String], keys: &[String]) -> bool {
+    intent_tags.iter().any(|t| {
+        let tn = norm_tag(t);
+        // 意图词沾边的同义组整体展开（"肉鸽" → rogue/roguelike/roguelite…）
+        let syns: Vec<String> = TAG_SYNONYM_GROUPS
+            .iter()
+            .filter(|g| g.iter().any(|m| tn.contains(&norm_tag(m))))
+            .flat_map(|g| g.iter().map(|m| norm_tag(m)))
+            .collect();
+        keys.iter().any(|k| {
+            let kn = norm_tag(k);
+            kn.contains(&tn)
+                || tn.contains(&kn)
+                || syns.iter().any(|s| kn.contains(s.as_str()))
+        })
+    })
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -331,23 +369,20 @@ pub fn recommend(
         // 品味键：用户投票标签优先，genres 兜底（非口味类目已过滤）
         let keys = taste_keys(detail.as_ref(), &tags);
 
-        // 硬过滤（意图级排除 + 修正层口味排除叠加）
-        if !intent.exclude_tags.is_empty()
-            && intent.exclude_tags.iter().any(|t| keys.iter().any(|k| k.contains(t.as_str())))
-        {
+        // 硬过滤（意图级排除 + 修正层口味排除叠加；与正向过滤同口径的双向 contains）
+        if !intent.exclude_tags.is_empty() && tags_match(&intent.exclude_tags, &keys) {
             continue;
         }
-        if !taste_excludes.is_empty()
-            && taste_excludes.iter().any(|t| keys.iter().any(|k| k.contains(t.as_str())))
-        {
-            continue;
-        }
-        if !intent.exclude_tags.is_empty()
-            && intent.exclude_tags.iter().any(|t| keys.iter().any(|k| k.contains(t.as_str())))
-        {
+        if !taste_excludes.is_empty() && tags_match(&taste_excludes, &keys) {
             continue;
         }
         if intent.exclude_apps.contains(&g.app_id) {
+            continue;
+        }
+        // 正向品类过滤：用户点名要某类玩法（如"牌组构建式类 Rogue"）→ 只留品味键命中的
+        // 游戏（与排除同口径的双向 contains，"Rogue" 能命中 "类 Rogue"）。全库无命中时
+        // agent 侧走「放宽条件」CTA。
+        if !intent.tags.is_empty() && !tags_match(&intent.tags, &keys) {
             continue;
         }
 
@@ -439,6 +474,11 @@ pub fn recommend(
         });
     }
 
+    if !intent.tags.is_empty() {
+        if let Some(tr) = trace {
+            tr(&format!("品类过滤：{} 款命中 {:?}", out.len(), intent.tags));
+        }
+    }
     Ok(rank_and_sample(out, intent.top_m as usize, temperature(opts.randomness, opts.exploration), opts.exploration, cfg.recommender.deterministic, &weight_keys, trace))
 }
 
@@ -588,6 +628,26 @@ mod tests {
             categories: categories.iter().map(|(d, id)| Tag { id: *id, description: d.to_string() }).collect(),
             storage_gb: None,
         }
+    }
+
+    #[test]
+    fn tags_match_accepts_length_and_language_variants() {
+        let keys: Vec<String> = ["牌组构建式类 Rogue", "卡牌游戏", "类 Rogue", "类银河战士恶魔城"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // 意图短词命中长标签（正向 contains）
+        assert!(tags_match(&["牌组构建".to_string()], &keys));
+        // 英文词命中中文混排标签（反向 contains）
+        assert!(tags_match(&["Rogue".to_string()], &keys));
+        // 同义组：俗名「肉鸽」命中官方标签「类 Rogue」
+        assert!(tags_match(&["肉鸽".to_string()], &keys));
+        // 同义组：口语「银河恶魔城」命中官方「类银河战士恶魔城」
+        assert!(tags_match(&["银河恶魔城".to_string()], &keys));
+        // 多标签任一命中即可
+        assert!(tags_match(&["解谜".to_string(), "卡牌".to_string()], &keys));
+        // 完全不沾边的意图不命中
+        assert!(!tags_match(&["恐怖".to_string()], &keys));
     }
 
     #[test]

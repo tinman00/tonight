@@ -285,18 +285,91 @@ fn motivation_match(p: &BartleAxes, g: &[f64; 4]) -> f64 {
     (1.0 - dist / 4.0).clamp(0.0, 1.0)
 }
 
-/// 品类同义组（小写、去空格/连字符后匹配）：俗名 ↔ 官方词形互认。
+/// 品类同义组（全部经 norm_tag 归一：小写、去空格/连字符）：俗名 ↔ 官方词形互认。
 /// 意图解析的 LLM 常把「类 Rogue」说成「肉鸽」、把「类银河战士恶魔城」说成「银河恶魔城」——
-/// 没有 同义组时这些口语词永远匹配不上库内官方标签。
+/// 没有同义组时这些口语词永远匹配不上库内官方标签。
+/// 并组判定用**整词相等**（归一后）而非子串包含：避免 "sports" 含 "rts"、"battle" 含 "t"
+/// 这类跨组误并；组内成员已枚举常见词形变体（含前缀复合词如"轻度肉鸽/牌组构建"），
+/// 未收录的复合词多与标签本身 contains 互容（"动作类 Rogue" ⊇ "Rogue"），无需入组。
 const TAG_SYNONYM_GROUPS: &[&[&str]] = &[
-    &["肉鸽", "rogue", "roguelike", "roguelite"],
-    &["银河恶魔城", "银河战士恶魔城", "银河城", "metroidvania"],
-    &["类魂", "魂系", "魂类", "souls", "soulslike"],
-    &["丧尸", "僵尸"],
-    &["第一人称射击", "fps", "射击"],
-    &["moba", "多人在线战术竞技"],
-    &["农场", "种田", "农耕"],
-    &["赛车", "竞速"],
+    // 肉鸽系（含轻肉鸽变体；"动作类 Rogue/轻度 Rogue"等库标签含 "rogue" 子串可直接 contains 命中）
+    &["肉鸽", "轻度肉鸽", "类rogue", "rogue", "roguelike", "roguelite", "轻rogue"],
+    // 牌组构建（Roguelike deckbuilder）
+    &["牌组构建", "牌组构筑", "卡牌构筑", "肉鸽卡牌", "deckbuilder", "deckbuilding"],
+    // 卡牌
+    &["卡牌", "卡牌游戏", "卡牌战斗", "纸牌", "集换式卡牌", "card", "cardgame"],
+    // 类魂
+    &["类魂", "魂系", "魂类", "类魂系列", "黑暗之魂", "souls", "soulslike", "soulsborne"],
+    // 银河恶魔城
+    &["银河恶魔城", "银河战士恶魔城", "银河城", "类银河城", "metroidvania"],
+    // 生存
+    &["生存", "生存建造", "荒野生存", "survival"],
+    // 沙盒
+    &["沙盒", "sandbox"],
+    // 开放世界
+    &["开放世界", "openworld", "无缝大地图"],
+    // 射击（第一/第三人称与泛射击）
+    &["射击", "第一人称射击", "第三人称射击", "枪战", "fps", "tps", "shooter"],
+    // 大逃杀
+    &["大逃杀", "吃鸡", "battleroyale", "br"],
+    // MOBA
+    &["moba", "多人在线战术竞技", "多人在线战斗竞技"],
+    // 格斗
+    &["格斗", "对战格斗", "格斗游戏", "fighting", "fightinggame"],
+    // 平台跳跃
+    &["平台游戏", "平台跳跃", "精确平台", "2d平台", "3d平台", "platformer"],
+    // 解谜
+    &["解谜", "益智", "烧脑", "puzzle", "puzzlegame"],
+    // 恐怖
+    &["恐怖", "惊悚", "心理恐怖", "恐怖游戏", "horror"],
+    // 剧情向
+    &["剧情", "剧情丰富", "叙事", "故事", "story", "storyrich", "narrative"],
+    // 步行模拟
+    &["步行模拟", "行走模拟器", "walkingsim", "walkingsimulator"],
+    // 回合制
+    &["回合制", "回合制战斗", "回合制策略", "turnbased"],
+    // 即时战略
+    &["即时战略", "即时战术", "rts"],
+    // 策略（含战棋/战术）
+    &["策略", "战略", "战棋", "战术", "strategy", "tactics"],
+    // 角色扮演
+    &["角色扮演", "日式rpg", "动作rpg", "rpg", "arpg", "jrpg", "crpg"],
+    // 种田/农场
+    &["农场", "种田", "农耕", "田园", "farming", "farmingsim"],
+    // 建造
+    &["建造", "基地建设", "基建", "basebuilding"],
+    // 模拟经营
+    &["模拟经营", "经营", "管理", "模拟", "tycoon", "sim", "simulation"],
+    // 塔防
+    &["塔防", "towerdefense"],
+    // 竞速
+    &["赛车", "竞速", "驾驶", "racing"],
+    // 动漫/二次元
+    &["动漫", "二次元", "日系", "anime"],
+    // 科幻/太空
+    &["科幻", "太空", "星际", "scifi", "sciencefiction"],
+    // 丧尸
+    &["丧尸", "僵尸", "zombie", "丧尸围城"],
+    // 合作
+    &["合作", "双人合作", "组队", "同屏合作", "coop", "cooperative"],
+    // 对抗
+    &["玩家对战", "对战", "pvp", "竞技场"],
+    // 硬核难度
+    &["硬核", "高难度", "困难", "低容错", "挑战性"],
+    // 像素
+    &["像素", "像素图形", "像素风", "pixel"],
+    // 音乐节奏
+    &["音乐", "节奏", "音游", "rhythm", "rhythmgame", "music"],
+    // 放置挂机
+    &["放置", "挂机", "idle", "incremental"],
+    // 视觉小说/恋爱
+    &["视觉小说", "文字冒险", "恋爱", "乙女", "galgame", "visualnovel"],
+    // 武侠功夫
+    &["武侠", "武术", "功夫", "kungfu", "wuxia", "martialarts"],
+    // 潜行
+    &["潜行", "潜入", "stealth"],
+    // 体育
+    &["体育", "足球", "篮球", "sports"],
 ];
 
 fn norm_tag(s: &str) -> String {
@@ -304,21 +377,32 @@ fn norm_tag(s: &str) -> String {
 }
 
 /// 意图标签与品味键匹配：小写归一后的双向 contains + 同义组展开
-/// （意图"肉鸽"命中标签"类 Rogue"；意图"Rogue"命中"类 Rogue"；意图"牌组构建"命中"牌组构建式类 Rogue"）
+/// （意图"肉鸽"命中标签"类 Rogue"；意图"Rogue"命中"类 Rogue"；意图"牌组构建"命中"牌组构建式类 Rogue"）。
+/// 同义组按整词相等并组（归一后），不做子串并组——"sports" 含 "rts" 之类不能把体育并入即时战略。
+/// 短 ASCII 同义词（≤3 字符，如 rts/br）要求整词相等才命中：
+/// 否则 "sports" 含 "rts" 这类子串会造成跨组误匹配。
+fn syn_hits(kn: &str, syns: &[String]) -> bool {
+    syns.iter().any(|s| {
+        if s.is_ascii() && s.len() <= 3 {
+            kn == s.as_str()
+        } else {
+            kn.contains(s.as_str())
+        }
+    })
+}
+
 pub fn tags_match(intent_tags: &[String], keys: &[String]) -> bool {
     intent_tags.iter().any(|t| {
         let tn = norm_tag(t);
-        // 意图词沾边的同义组整体展开（"肉鸽" → rogue/roguelike/roguelite…）
+        // 意图词与某组成员整词相等 → 该组全部成员展开为同义键
         let syns: Vec<String> = TAG_SYNONYM_GROUPS
             .iter()
-            .filter(|g| g.iter().any(|m| tn.contains(&norm_tag(m))))
+            .filter(|g| g.iter().any(|m| *m == tn))
             .flat_map(|g| g.iter().map(|m| norm_tag(m)))
             .collect();
         keys.iter().any(|k| {
             let kn = norm_tag(k);
-            kn.contains(&tn)
-                || tn.contains(&kn)
-                || syns.iter().any(|s| kn.contains(s.as_str()))
+            kn.contains(&tn) || tn.contains(&kn) || syn_hits(&kn, &syns)
         })
     })
 }
@@ -648,6 +732,33 @@ mod tests {
         assert!(tags_match(&["解谜".to_string(), "卡牌".to_string()], &keys));
         // 完全不沾边的意图不命中
         assert!(!tags_match(&["恐怖".to_string()], &keys));
+    }
+
+    #[test]
+    fn tags_match_covers_expanded_synonym_groups() {
+        let k = |ss: &[&str]| ss.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // 类魂/魂系 俗语
+        assert!(tags_match(&["魂系".to_string()], &k(&["类魂系列", "困难"])));
+        // 大逃杀俗称"吃鸡"
+        assert!(tags_match(&["吃鸡".to_string()], &k(&["大逃杀", "多人"])));
+        // 平台跳跃变体
+        assert!(tags_match(&["平台跳跃".to_string()], &k(&["2D 平台", "精确平台"])));
+        // 归一：大小写与空格（"Tower Defense" ↔ "塔防"组、"FPS"大小写）
+        assert!(tags_match(&["塔防".to_string()], &k(&["Tower Defense"])));
+        assert!(tags_match(&["fps".to_string()], &k(&["第一人称射击", "射击"])));
+        // 视觉小说/恋爱
+        assert!(tags_match(&["galgame".to_string()], &k(&["视觉小说", "恋爱"])));
+        // 潜行
+        assert!(tags_match(&["潜入".to_string()], &k(&["潜行", "刺客"])));
+    }
+
+    #[test]
+    fn tags_match_group_join_is_exact_not_substring() {
+        let k = |ss: &[&str]| ss.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // "sports" 含子串 "rts"，但整词并组不允许把体育并入即时战略组
+        assert!(!tags_match(&["体育".to_string()], &k(&["即时战略", "rts"])));
+        // 反向同样：即时战略不因子串误入别的组
+        assert!(!tags_match(&["即时战略".to_string()], &k(&["体育", "sports"])));
     }
 
     #[test]

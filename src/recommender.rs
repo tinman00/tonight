@@ -16,6 +16,8 @@ pub struct IntentFilters {
     pub exclude_tags: Vec<String>,
     pub max_session_min: Option<u32>,
     pub only_instant: bool,
+    /// 本地优先（对话输入区开关，默认开）：只推本机已安装（含需更新）的游戏
+    pub only_installed: bool,
     pub top_m: u32,
     /// 用户当次心境（轻松/沉浸/成就向/社交…），P0 传给卡片文案
     pub mood: Option<String>,
@@ -416,6 +418,27 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// 本机操作系统（服务端运行在用户机器上，运行时判定即玩家平台）。
+/// Steam 平台标识是 "mac"，而 env::consts::OS 返回 "macos"——做一次映射。
+fn host_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "mac",
+        other => other, // "windows" / "linux" 与 Steam 标识一致
+    }
+}
+
+/// 平台是否支持（纯函数）：平台信息未知（None/空）视为支持——静默过滤宁漏勿误；
+/// mac/linux 主机过滤掉不含本平台的 Windows-only 游戏，Windows 主机天然全兼容。
+/// host 兼容 "macos"（env::consts::OS 原始值）与 "mac"（Steam 标识）两种写法。
+pub fn platform_supported(host: &str, platforms: Option<&[String]>) -> bool {
+    let host = if host == "macos" { "mac" } else { host };
+    match platforms {
+        None => true,
+        Some(p) if p.is_empty() => true,
+        Some(p) => p.iter().any(|x| x == host),
+    }
+}
+
 /// 内部评分推荐：候选（未开封/试玩即弃/弃坑，剔除非游戏与注水）→ 硬过滤 → 六分量加权 → Top-M。
 /// use_llm = 是否融合 LLM 定位缓存（用户开关，design.md §7.5 可选增强③）。
 /// opts = 探索感（softmax 温度）与探索模式开关（§7.9①）；trace 上报探索位命中情况。
@@ -455,6 +478,10 @@ pub fn recommend(
         }
         let detail = store.app_detail(g.app_id)?;
         let tags = store.store_tags(g.app_id)?.unwrap_or_default();
+        // 静默平台过滤：mac/linux 主机不推不支持本平台的游戏（平台信息未知则放行）
+        if !platform_supported(host_os(), detail.as_ref().and_then(|d| d.platforms.as_deref())) {
+            continue;
+        }
         // 品味键：用户投票标签优先，genres 兜底（非口味类目已过滤）
         let keys = taste_keys(detail.as_ref(), &tags);
 
@@ -482,6 +509,10 @@ pub fn recommend(
             None => ("未安装", 0.0),
         };
         if intent.only_instant && badge != "立即可玩" {
+            continue;
+        }
+        // 本地优先（对话区开关）：未安装的不进候选池；"需更新"属于本地有，保留
+        if intent.only_installed && !installed.contains_key(&g.app_id) {
             continue;
         }
 
@@ -723,6 +754,7 @@ mod tests {
             genres: genres.iter().map(|(d, id)| Tag { id: *id, description: d.to_string() }).collect(),
             categories: categories.iter().map(|(d, id)| Tag { id: *id, description: d.to_string() }).collect(),
             storage_gb: None,
+            platforms: None,
         }
     }
 
@@ -771,6 +803,23 @@ mod tests {
         assert!(!tags_match(&["体育".to_string()], &k(&["即时战略", "rts"])));
         // 反向同样：即时战略不因子串误入别的组
         assert!(!tags_match(&["即时战略".to_string()], &k(&["体育", "sports"])));
+    }
+
+    #[test]
+    fn platform_supported_silent_filter() {
+        let plats = |ss: &[&str]| ss.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let win_mac = plats(&["windows", "mac"]);
+        // mac 主机：支持 mac 的放行，Windows-only 剔除
+        assert!(platform_supported("macos", Some(&win_mac)));
+        assert!(!platform_supported("macos", Some(&plats(&["windows"]))));
+        // linux 主机
+        assert!(platform_supported("linux", Some(&plats(&["linux"]))));
+        assert!(!platform_supported("linux", Some(&plats(&["windows", "mac"]))));
+        // Windows 主机天然全兼容
+        assert!(platform_supported("windows", Some(&win_mac)));
+        // 平台未知（旧缓存/解析缺失）→ 宁漏勿误，放行
+        assert!(platform_supported("macos", None));
+        assert!(platform_supported("linux", Some(&[])));
     }
 
     #[test]

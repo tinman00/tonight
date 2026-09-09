@@ -449,7 +449,7 @@ impl SteamStore {
         app_id: u32,
     ) -> Result<Option<crate::models::AppDetail>, SteamError> {
         let url = format!(
-            "{STORE_BASE}/api/appdetails?appids={app_id}&l=schinese&filters=basic,genres,categories"
+            "{STORE_BASE}/api/appdetails?appids={app_id}&l=schinese&filters=basic,platforms,genres,categories"
         );
         let text = self.get_with_retry(&url, None, &self.api_limiter).await?;
                 #[derive(Deserialize)]
@@ -466,6 +466,17 @@ impl SteamStore {
                     genres: Option<Vec<TagRaw>>,
                     #[serde(default)]
                     categories: Option<Vec<TagRaw>>,
+                    #[serde(default)]
+                    platforms: Option<PlatformsRaw>,
+                }
+                #[derive(Deserialize)]
+                struct PlatformsRaw {
+                    #[serde(default)]
+                    windows: bool,
+                    #[serde(default)]
+                    mac: bool,
+                    #[serde(default)]
+                    linux: bool,
                 }
                 #[derive(Deserialize)]
                 struct TagRaw {
@@ -513,6 +524,14 @@ impl SteamStore {
                     storage_gb: None,
                     genres: conv(d.genres),
                     categories: conv(d.categories),
+                    // 平台支持（filters=basic 自带）；全 false/缺失视为未知
+                    platforms: d.platforms.and_then(|p| {
+                        let mut v = Vec::new();
+                        if p.windows { v.push("windows".into()); }
+                        if p.mac { v.push("mac".into()); }
+                        if p.linux { v.push("linux".into()); }
+                        if v.is_empty() { None } else { Some(v) }
+                    }),
                 }))
     }
 

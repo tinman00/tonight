@@ -1129,6 +1129,7 @@ mod tests {
             genres: vec![crate::models::Tag { id: 1, description: "动作".into() }],
             categories: vec![],
             storage_gb: None,
+            platforms: None,
         }
     }
 

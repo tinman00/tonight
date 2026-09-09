@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS app_details (              -- Tier D：商店详情�
     genres     TEXT NOT NULL,                          -- JSON: [{id,description}]
     categories TEXT NOT NULL,                          -- JSON: [{id,description}]
     storage_gb REAL,                                   -- 存储空间需求（商店页解析，NULL=未知）
+    platforms  TEXT,                                   -- JSON: ["windows","mac","linux"]（NULL=未知）
     updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS achievement_categories (   -- C4：成就类型（LLM 分析，永久缓存）
@@ -134,6 +135,8 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         // 增量迁移：旧库补 storage_gb 列（新库由 SCHEMA 直接建）
         conn.execute_batch("ALTER TABLE app_details ADD COLUMN storage_gb REAL").ok();
+        // 增量迁移：旧库补 platforms 列（v0.62 平台过滤；NULL=未知，视为缺失待回填）
+        conn.execute_batch("ALTER TABLE app_details ADD COLUMN platforms TEXT").ok();
         // 增量迁移：深度档"长期在线"→"暂离"、"已通关"→"已完成"（v0.35/0.36 更名，存量标注直接改写）
         conn.execute_batch(
             "UPDATE manual_overrides SET value = '暂离' WHERE kind = 'depth' AND value = '长期在线';
@@ -353,11 +356,15 @@ impl Store {
             &d.categories.iter().map(|t| (t.id, &t.description)).collect::<Vec<_>>(),
         )
         .unwrap_or_else(|_| "[]".into());
+        let platforms = d
+            .platforms
+            .as_ref()
+            .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "[]".into()));
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO app_details (app_id, app_type, genres, categories, storage_gb, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![app_id, d.app_type, genres, categories, d.storage_gb, now()],
+            "INSERT OR REPLACE INTO app_details (app_id, app_type, genres, categories, storage_gb, platforms, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![app_id, d.app_type, genres, categories, d.storage_gb, platforms, now()],
         )?;
         Ok(())
     }
@@ -365,7 +372,7 @@ impl Store {
     pub fn app_detail(&self, app_id: u32) -> rusqlite::Result<Option<AppDetail>> {
         let conn = self.conn.lock().unwrap();
         let row = conn.query_row(
-            "SELECT app_type, genres, categories, storage_gb FROM app_details WHERE app_id = ?1",
+            "SELECT app_type, genres, categories, storage_gb, platforms FROM app_details WHERE app_id = ?1",
             params![app_id],
             |r| {
                 Ok((
@@ -373,10 +380,11 @@ impl Store {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             },
         );
-        let Ok((app_type, genres, categories, storage_gb)) = row else {
+        let Ok((app_type, genres, categories, storage_gb, platforms)) = row else {
             return Ok(None);
         };
         let parse_tags = |json: &str| -> Vec<Tag> {
@@ -386,11 +394,16 @@ impl Store {
                 .map(|(id, description)| Tag { id, description })
                 .collect()
         };
+        let parse_platforms = |json: &Option<String>| -> Option<Vec<String>> {
+            json.as_deref()
+                .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        };
         Ok(Some(AppDetail {
             app_type,
             genres: parse_tags(&genres),
             categories: parse_tags(&categories),
             storage_gb,
+            platforms: parse_platforms(&platforms),
         }))
     }
 
@@ -398,7 +411,9 @@ impl Store {
     pub fn owned_without_details(&self) -> rusqlite::Result<Vec<u32>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
-            "SELECT app_id FROM owned_games WHERE app_id NOT IN (SELECT app_id FROM app_details) ORDER BY app_id",
+            // platforms IS NULL 的旧缓存也算"缺失"：下次同步顺带回填平台信息（平台过滤依赖）
+            "SELECT app_id FROM owned_games WHERE app_id NOT IN (SELECT app_id FROM app_details)
+             OR app_id IN (SELECT app_id FROM app_details WHERE platforms IS NULL) ORDER BY app_id",
         )?;
         let rows = stmt.query_map([], |r| Ok(r.get::<_, i64>(0)? as u32))?;
         rows.collect()

@@ -399,6 +399,8 @@ async fn run_recommend(
         exclude_tags,
         max_session_min,
         only_instant: instant_only,
+        // CLI --tag 推荐不做本地限制（未安装的也能浏览）
+        only_installed: false,
         top_m: top.unwrap_or(cfg.recommender.top_m),
         mood: None,
         exclude_apps: Vec::new(),

@@ -248,6 +248,16 @@ main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
   padding: 0 26px; border-radius: 12px; font-size: 14px; cursor: pointer;
 }
 #chat-send:disabled { opacity: .5; cursor: wait; }
+/* 本地优先开关：开=蓝色描边高亮（与发送按钮同色系），关=暗底灰字 */
+#chat-local {
+  background: var(--bg3); border: 1px solid var(--border); color: var(--fg-dim);
+  padding: 0 14px; border-radius: 12px; font-size: 13px; cursor: pointer;
+  white-space: nowrap; transition: color .15s, border-color .15s, background .15s;
+}
+#chat-local.on {
+  background: rgba(91, 155, 245, .14); border-color: var(--accent); color: var(--accent);
+  font-weight: 700;
+}
 
 /* ===== 通用小件 ===== */
 h3.sec { margin: 22px 0 10px; font-size: 14px; color: var(--accent); }

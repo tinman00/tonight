@@ -285,7 +285,7 @@ pub async fn run(
                         // success=false（商店已下架等）：记 unknown，避免每次同步重试
                         Ok(None) => store.upsert_app_detail(
                             app_id,
-                            &AppDetail { app_type: "unknown".into(), genres: vec![], categories: vec![], storage_gb: None },
+                            &AppDetail { app_type: "unknown".into(), genres: vec![], categories: vec![], storage_gb: None, platforms: None },
                         )?,
                         Err(e) => {
                             tracing::warn!("app {app_id} 商店详情拉取失败（稍后重试）: {e}");
@@ -385,7 +385,7 @@ pub async fn run(
                         Ok(None) => {
                             store.upsert_app_detail(
                                 *app_id,
-                                &AppDetail { app_type: "unknown".into(), genres: vec![], categories: vec![], storage_gb: None },
+                                &AppDetail { app_type: "unknown".into(), genres: vec![], categories: vec![], storage_gb: None, platforms: None },
                             )?;
                         }
                         Err(_) => still += 1,
@@ -727,7 +727,7 @@ pub async fn repair(
                 Ok(None) => {
                     store.upsert_app_detail(
                         *app_id,
-                        &AppDetail { app_type: "unknown".into(), genres: vec![], categories: vec![], storage_gb: None },
+                        &AppDetail { app_type: "unknown".into(), genres: vec![], categories: vec![], storage_gb: None, platforms: None },
                     )?;
                     still_failed += 1;
                     line(&format!("  [{}] {}：商店确认不可用（下架/合集包），维持剔除", i + 1, name));

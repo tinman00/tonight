@@ -78,6 +78,8 @@ pub struct AppDetail {
     pub categories: Vec<Tag>,
     /// 存储空间需求 GB（商店页系统需求区解析；None = 未知）
     pub storage_gb: Option<f64>,
+    /// 支持平台（appdetails basic.platforms：windows/mac/linux）；None = 未知（旧缓存，不过滤）
+    pub platforms: Option<Vec<String>>,
 }
 
 /// 软件类目（Steam 商店的非游戏分类，中/英双保险）。

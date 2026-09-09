@@ -147,6 +147,8 @@ function initEmptyPage() {
 initEmptyPage();
 
 // ============ 对话（纵向 fullpage 整页 + 横向 peek 轮播，CTA 卡滑到即换批） ============
+// 本地优先开关（输入区「⌂ 本地优先」按钮，默认开）：只推本机已安装的游戏
+const localFirstOn = () => localStorage.getItem("wtp_local_first") !== "0";
 // 会话 ID 用 sessionStorage：每次打开页面 = 一个新会话（历史页按访问分组），
 // 同一次访问内的多轮对话仍归入同一会话
 const SESSION = (() => {
@@ -411,7 +413,7 @@ function handleNav(t, d) {
 }
 
 async function streamAsk(message, t) {
-  await sseStream("/api/ask", { message, session_id: SESSION }, (ev) => {
+  await sseStream("/api/ask", { message, session_id: SESSION, local_first: localFirstOn() }, (ev) => {
     if (ev.type === "trace") {
       t.trace.appendChild(el("div", "trace", ev.payload.text));
       t.trace.scrollTop = t.trace.scrollHeight;
@@ -607,6 +609,14 @@ async function send() {
 }
 
 $("#chat-form").addEventListener("submit", (e) => { e.preventDefault(); send(); });
+// 本地优先开关：默认开（localStorage 持久化），点击即时切换，下一次提问生效
+const localBtn = $("#chat-local");
+const syncLocalBtn = () => localBtn.classList.toggle("on", localFirstOn());
+syncLocalBtn();
+localBtn.addEventListener("click", () => {
+  localStorage.setItem("wtp_local_first", localFirstOn() ? "0" : "1");
+  syncLocalBtn();
+});
 
 // 键盘：←→ 驱动当前可见页对应轮次的轮播，↑↓ 切换轮次页
 function currentPageTurn() {
@@ -671,11 +681,10 @@ async function loadLibrary() {
       </div>
     </div>
     <div class="muted" style="margin:6px 0 2px">点击游戏左上角的深度角标可手动标注（无成就游戏标「已完成」、长线游戏标「暂离」——手动标注永远优先于自动判定）</div>
+    ${libSyncProgressHtml()}
     <div style="margin:2px 0 6px"><button class="btn" id="lib-idle-mode" title="勾选多款游戏后一键确认为时长注水（挂卡/挂机）">⏱ 标注时长注水</button></div>
     <div class="pbar hidden" id="lib-repair-bar"><div class="pfill"></div></div>
-    <div id="lib-repair-log" class="hidden"></div>
-    <div class="pbar hidden" id="lib-sync-bar"><div class="pfill"></div></div>
-    <div id="lib-sync-log" class="hidden"></div>`;
+    <div id="lib-repair-log" class="hidden"></div>`;
     // 识别异常管理：显式列出自动识别可能有问题的游戏（数据类可自动修复；判断类——疑似已玩完/疑似注水——快捷手动标注，琥珀色 = 不可自动修复）
     const anomalies = lib.anomalies || [];
     const judge = anomalies.filter((a) => a.kind === "suspect_finished" || a.kind === "idle_proposed");
@@ -734,16 +743,23 @@ async function loadLibrary() {
       </div>`;
     }
     html += `</div>`;
-    body.innerHTML = html;
-    $("#lib-sync").addEventListener("click", () => runLibrarySync());
-    // 本地状态刷新（零网络、秒级）：local_only 同步——装了/卸了/更新了 Steam 游戏后即时反映
+  body.innerHTML = html;
+  $("#lib-sync").addEventListener("click", () => runLibrarySync());
+  bindLibSyncClose();
+    // 本地状态刷新（零网络、秒级）：local_only 同步——装了/卸了/更新了 Steam 游戏后即时反映。
+    // 进度展示与「更新游戏库」同款共享进度区（进度条 + 日志，完成不自动关闭）
     $("#lib-local").addEventListener("click", async () => {
       const btn = $("#lib-local");
       btn.disabled = true;
       btn.textContent = "⌂ 扫描中…";
+      libSync.text = "";
+      libSync.pct = 0;
+      libSync.open = true;
+      libSyncApply({ type: "progress", payload: { text: "开始扫描本机 Steam 安装状态…" } });
       try {
-        await sseStream("/api/sync/start", { local_only: true }, () => {});
+        await sseStream("/api/sync/start", { local_only: true }, (ev) => libSyncApply(ev));
       } catch (e) { /* 静默，下面重渲染反映真实状态 */ }
+      libSyncApply({ type: "done", payload: { message: "扫描完成" } });
       btn.disabled = false;
       btn.textContent = "⌂ 更新本地状态";
       loadLibrary();
@@ -950,28 +966,70 @@ function renderLibraryEmpty(body) {
       <button class="btn primary" id="lib-sync">⟳ 开始同步</button>
       <span class="muted hidden" id="lib-syncing">同步中…</span>
     </div>
-    <div class="pbar hidden" id="lib-sync-bar"><div class="pfill"></div></div>
-    <div id="lib-sync-log" class="hidden"></div>
+    ${libSyncProgressHtml()}
     <div class="muted" style="margin-top:8px">
       SteamID64 在哪看：Steam 个人资料页地址 …/profiles/ 后面的 17 位数字。首次同步视库大小约 3–15 分钟（数百款游戏时偏上限），之后增量秒级。
     </div>
   </div>`;
   $("#lib-sync").addEventListener("click", () => runLibrarySync());
+  bindLibSyncClose();
+}
+
+// 库存页同步进度区状态：loadLibrary 重渲染会吞掉动态 DOM，这里持久化文本/进度/开合，
+// 重渲染后原样回显；运行完不自动关闭，显式「收起日志」才隐藏；下一轮同步先清空
+const libSync = { text: "", pct: 0, open: false };
+function libSyncProgressHtml() {
+  return `<div id="lib-sync-progress" class="${libSync.open ? "" : "hidden"}" style="margin:10px 0">
+    <div class="pbar"><div class="pfill" style="width:${libSync.pct}%"></div></div>
+    <div id="lib-sync-log">${esc(libSync.text)}</div>
+    <div style="text-align:right;margin:-8px 0 10px">
+      <button class="btn" id="lib-sync-log-close" title="收起日志区（不影响同步）">收起日志 ✕</button>
+    </div>
+  </div>`;
+}
+function bindLibSyncClose() {
+  $("#lib-sync-log-close")?.addEventListener("click", () => {
+    libSync.open = false;
+    $("#lib-sync-progress")?.classList.add("hidden");
+  });
+}
+// 把 SSE 事件写入状态并同步到当前 DOM（元素被重渲染重建时只更新状态，渲染后回显）
+function libSyncApply(ev) {
+  if (ev.type === "progress") {
+    if (ev.payload.text) libSync.text += (libSync.text ? "\n" : "") + ev.payload.text;
+    if (ev.payload.pct != null) libSync.pct = ev.payload.pct;
+  } else if (ev.type === "done") {
+    libSync.text += (libSync.text ? "\n" : "") + "✔ " + ev.payload.message;
+    libSync.pct = 100;
+  } else if (ev.type === "error") {
+    libSync.text += (libSync.text ? "\n" : "") + "✖ " + (ev.payload.message || "失败");
+  }
+  const box = $("#lib-sync-progress");
+  if (box) {
+    // 开合状态也在这里同步：关闭后再点同步要立即展开（而不是等渲染后回显）
+    box.classList.toggle("hidden", !libSync.open);
+    if (libSync.open) {
+      box.querySelector(".pfill").style.width = libSync.pct + "%";
+      const log = box.querySelector("#lib-sync-log");
+      log.textContent = libSync.text;
+      log.scrollTop = log.scrollHeight;
+    }
+  }
 }
 
 async function runLibrarySync() {
-  const log = $("#lib-sync-log");
-  const bar = $("#lib-sync-bar .pfill");
+  // 新一轮同步：清空上一轮日志、展开进度区
+  libSync.text = "";
+  libSync.pct = 0;
+  libSync.open = true;
+  libSyncApply({ type: "progress", payload: { text: "开始同步…" } });
   const steamid = $("#lib-steamid") ? $("#lib-steamid").value.trim() : "";
-  log.classList.remove("hidden");
-  if (bar) bar.classList.remove("hidden");
-  log.textContent = "开始同步…";
   $("#lib-sync").disabled = true;
   $("#lib-syncing").classList.remove("hidden");
   let failed = false;
   await sseStream("/api/sync/start", { steamid: steamid || null }, (ev) => {
     if (ev.type === "error") failed = true;
-    renderSyncProgress(ev, $("#lib-sync-bar .pfill"), log);
+    libSyncApply(ev);
   });
   $("#lib-sync").disabled = false;
   $("#lib-syncing").classList.add("hidden");

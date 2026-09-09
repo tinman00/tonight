@@ -372,9 +372,14 @@ fn parse_cards_response(content: &str, facts: &[GameFacts]) -> std::result::Resu
         return Err("卡片数量超过 3".into());
     }
     let valid_ids: Vec<u32> = facts.iter().map(|f| f.app_id).collect();
+    let mut seen = std::collections::HashSet::new();
     for c in &w.cards {
         if !valid_ids.contains(&c.app_id) {
             return Err(format!("app_id {} 不在候选列表中", c.app_id));
+        }
+        // 同批去重：LLM 偶发对同一游戏输出两张卡（主批+探索位撞车），保留首次出现的
+        if !seen.insert(c.app_id) {
+            return Err(format!("app_id {} 重复出现", c.app_id));
         }
         if c.title.trim().is_empty() || c.blurb.trim().is_empty() {
             return Err(format!("app_id {} 的 title/blurb 存在空值", c.app_id));
@@ -766,6 +771,7 @@ fn default_filters(cfg: &Config) -> IntentFilters {
         exclude_tags: vec![],
         max_session_min: None,
         only_instant: false,
+        only_installed: false,
         top_m: cfg.recommender.top_m,
         mood: None,
         exclude_apps: vec![],
@@ -782,6 +788,7 @@ pub async fn handle_turn(
     digest: &str,
     state: &mut AskState,
     input: &str,
+    local_first: bool,
     trace: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<TurnResult> {
     budget_check(store, cfg)?;
@@ -908,6 +915,8 @@ pub async fn handle_turn(
     intent.max_session_min = parsed.max_session_min;
     intent.mood = parsed.mood.clone();
     intent.only_instant = parsed.instant_only;
+    // 本地优先（对话输入区开关，跨换批/放宽持续生效）：未安装游戏不进候选池
+    intent.only_installed = local_first;
     intent.exclude_apps = parsed.exclude_apps.clone();
 
     // ② 2a 确定性评分（数字归代码）；探索感 = 设置页滑条 → softmax 温度，探索模式再提温
@@ -1095,7 +1104,8 @@ pub async fn run_ask(db: &Path, cfg: &Config) -> Result<()> {
         if matches!(input.to_lowercase().as_str(), "q" | "quit" | "exit" | "退出") {
             break;
         }
-        let result = handle_turn(&store, cfg, &llm, &profile, &digest, &mut state, input, &|s| {
+        // CLI 形态不启用本地优先（保持全库候选；Web 由输入区开关控制）
+        let result = handle_turn(&store, cfg, &llm, &profile, &digest, &mut state, input, false, &|s| {
             println!("[轨迹] {s}")
         })
         .await;
@@ -1182,6 +1192,11 @@ mod tests {
         let bad = "{\"cards\":[{\"app_id\":999,\"title\":\"x\",\"blurb\":\"y\",\"suggested_session_min\":1}]}";
         assert!(parse_cards_response(bad, &facts).is_err());
         assert!(parse_cards_response("不是 JSON", &facts).is_err());
+        // 同批重复 app_id → 校验失败（供带错重试），不得输出重复卡
+        let dup = format!(
+            "{{\"cards\":[{{\"app_id\":105600,\"title\":\"a\",\"blurb\":\"{long_blurb}\",\"suggested_session_min\":60}},{{\"app_id\":105600,\"title\":\"b\",\"blurb\":\"{long_blurb}\",\"suggested_session_min\":60}}]}}"
+        );
+        assert!(parse_cards_response(&dup, &facts).is_err());
     }
 
     #[test]

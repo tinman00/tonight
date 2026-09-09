@@ -1370,6 +1370,9 @@ fn friendly_sync_error(e: &anyhow::Error) -> String {
 struct AskReq {
     message: String,
     session_id: String,
+    /// 本地优先（对话输入区开关）：只推本机已安装的游戏；缺省 false（CLI/旧客户端行为不变）
+    #[serde(default)]
+    local_first: bool,
 }
 
 async fn api_ask(
@@ -1425,6 +1428,7 @@ async fn api_ask(
             &digest,
             &mut state,
             &req.message,
+            req.local_first,
             &move |s: &str| {
                 let _ = trace_tx.send(Ok(sse_event("trace", &json!({"text": s}))));
             },

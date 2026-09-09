@@ -285,6 +285,14 @@ ul.plain { margin: 4px 0; padding-left: 18px; color: var(--fg-dim); font-size: 1
   font-family: Consolas, monospace; color: var(--fg-dim); white-space: pre-wrap;
   margin-bottom: 16px;
 }
+/* 修复日志：与同步日志同款（深底等宽、pre-wrap 正常换行），置于异常清单上方 */
+#lib-repair-log {
+  background: #0a0d12; border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px; max-height: 180px; overflow-y: auto; font-size: 12px;
+  font-family: Consolas, monospace; color: var(--fg-dim); white-space: pre-wrap;
+  margin: 8px 0 16px;
+}
+#lib-repair-bar { margin: 10px 0 2px; }
 .lib-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 16px; }
 .lib-item {
   background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius);
@@ -294,6 +302,8 @@ ul.plain { margin: 4px 0; padding-left: 18px; color: var(--fg-dim); font-size: 1
 .lib-item:hover { border-color: var(--accent); transform: translateY(-2px); }
 .lib-item.dimmed { opacity: .38; filter: grayscale(.85); }
 .lib-cover-wrap { position: relative; aspect-ratio: 460 / 215; background: linear-gradient(135deg, #202937, #171d29); }
+/* 不做合成层提升（translateZ/will-change）：提升会让封面与角标走独立合成层滚动，
+   反而领先页面其余元素产生"分层滑动"——统一走主层，全卡片同速滚动 */
 .lib-cover { width: 100%; height: 100%; object-fit: cover; display: block; }
 .depth-chip {
   position: absolute; left: 8px; top: 8px;
@@ -303,6 +313,34 @@ ul.plain { margin: 4px 0; padding-left: 18px; color: var(--fg-dim); font-size: 1
 }
 .depth-chip:hover { border-color: var(--accent); }
 .depth-chip.manual { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(91,155,245,.35); }
+/* 时长注水角标：深色底 + 琥珀字，封面上清晰可读；仅展示，操作在异常清单/勾选模式
+   （不用 backdrop-filter——滚动时会让角标与封面卡产生可见的跟随延迟） */
+.idle-chip {
+  position: absolute; right: 8px; top: 8px;
+  font-size: 11px; padding: 2px 9px; border-radius: 12px; z-index: 3;
+  background: rgba(10, 13, 19, .82); border: 1px solid rgba(240,164,76,.7);
+  color: #f5b04e; font-weight: 700;
+}
+/* 批量勾选模式的勾选圈（默认隐藏，进入模式才显示） */
+.idle-check {
+  position: absolute; right: 8px; bottom: 8px; width: 22px; height: 22px;
+  border-radius: 50%; border: 2px solid rgba(255,255,255,.55);
+  background: rgba(0,0,0,.45); z-index: 4; display: none; cursor: pointer;
+  font-size: 13px; line-height: 18px; text-align: center; color: #fff;
+}
+.idle-check.show { display: block; }
+.idle-check.on { background: #f0a44c; border-color: #f0a44c; }
+.idle-check.on::after { content: "✓"; font-weight: 800; }
+/* 勾选模式底部操作条 */
+.idle-selectbar {
+  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+  z-index: 300; display: flex; gap: 12px; align-items: center;
+  background: var(--bg3); border: 1px solid rgba(240,164,76,.5); border-radius: 14px;
+  padding: 10px 18px; font-size: 13px; color: var(--fg);
+  box-shadow: 0 12px 40px rgba(0,0,0,.55);
+}
+/* 不可自动修复的判断类异常条目：琥珀左边条 */
+.anomaly-item.amber { border-left: 3px solid #f0a44c; }
 .depth-menu {
   position: fixed; z-index: 200; min-width: 128px;
   background: var(--bg3); border: 1px solid var(--border); border-radius: 10px;

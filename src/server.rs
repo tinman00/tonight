@@ -1012,6 +1012,9 @@ struct AnnotationReq {
     status: String, // confirmed / rejected
     /// 口味排除撤销：按标签内容（app_id 传 0）
     revoke_tag: Option<String>,
+    /// 批量标注注水（库存页勾选模式）：给了 app_ids 时忽略 app_id
+    #[serde(default)]
+    app_ids: Vec<u32>,
 }
 
 async fn api_annotation(State(app): State<Shared>, Json(req): Json<AnnotationReq>) -> impl IntoResponse {
@@ -1033,7 +1036,19 @@ async fn api_annotation(State(app): State<Shared>, Json(req): Json<AnnotationReq
         Ok(s) => s,
         Err(e) => return err_json(e),
     };
-    match store.set_annotation_status(req.app_id, &req.status) {
+    // 批量（库存页勾选确认注水）优先
+    if !req.app_ids.is_empty() {
+        let mut done = 0usize;
+        for id in &req.app_ids {
+            match store.set_idle_mark(*id, &req.status) {
+                Ok(_) => done += 1,
+                Err(e) => return err_json(format!("第 {done} 款（app {id}）失败：{e}")),
+            }
+        }
+        return Json(json!({"ok": true, "count": done}));
+    }
+    // upsert：机器提议过的更新状态，从未提议过的（库存页手动标注）直接插入
+    match store.set_idle_mark(req.app_id, &req.status) {
         Ok(_) => Json(json!({"ok": true})),
         Err(e) => err_json(e),
     }

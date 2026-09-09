@@ -50,6 +50,8 @@ pub struct Candidate {
     pub breakdown: ScoreBreakdown,
     /// 探索位注入（"换个口味"角标）：动机相近、标签未接触的强制席位
     pub explore: bool,
+    /// 时长注水（嫌疑/已确认）：照常推荐，但事实包与卡片不含时长内容（无痕）
+    pub inflated: bool,
 }
 
 /// 探索感与探索模式参数（§7.9①）。
@@ -440,9 +442,12 @@ pub fn recommend(
     let weight_keys: Vec<String> = profile.tag_weights.keys().cloned().collect();
 
     for g in &profile.games {
-        if g.exclusion.is_some() {
-            continue; // 非游戏 / 注水（v0 简化：注水游戏不进候选，数据不可信）
+        // 工具软件不进候选；注水（嫌疑/已确认）**不再排除**——照常推荐，
+        // 但卡片与事实包无痕（不出现任何时长内容，见 build_facts 的 hide_playtime）
+        if g.exclusion.as_deref() == Some("非游戏软件") {
+            continue;
         }
+        let inflated = g.exclusion.is_some();
         // 候选：未开封/试玩即弃/弃坑 + 活跃中（玩家正在玩的也该能被推荐——"接着玩街霸6"）；
         // 仅排除已通关（完成度已兑现）。积压分量会自然压低活跃游戏的排名。
         if matches!(g.depth, GameDepth::Finished) {
@@ -555,12 +560,19 @@ pub fn recommend(
                 total,
             },
             explore: false,
+            inflated,
         });
     }
 
     if !intent.tags.is_empty() {
         if let Some(tr) = trace {
             tr(&format!("品类过滤：{} 款命中 {:?}", out.len(), intent.tags));
+        }
+    }
+    if let Some(tr) = trace {
+        let n = out.iter().filter(|c| c.inflated).count();
+        if n > 0 {
+            tr(&format!("有 {n} 款疑似/确认时长注水：照常推荐，卡片不出现时长内容；可到库存页手动标注确认"));
         }
     }
     Ok(rank_and_sample(out, intent.top_m as usize, temperature(opts.randomness, opts.exploration), opts.exploration, cfg.recommender.deterministic, &weight_keys, trace))
@@ -841,6 +853,7 @@ mod tests {
                 total,
             },
             explore: false,
+            inflated: false,
         }
     }
 

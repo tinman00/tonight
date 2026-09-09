@@ -621,10 +621,12 @@ pub async fn repair(
     let anomalies = crate::profiler::detect_anomalies(&store, cfg)?;
     let mut need_ach: Vec<u32> = Vec::new();
     let mut need_detail: Vec<u32> = Vec::new();
+    let mut need_cat = false;
     for (app_id, _, kind, _) in &anomalies {
         match kind.as_str() {
             "no_ach" => need_ach.push(*app_id),
             "no_detail" => need_detail.push(*app_id),
+            "ach_uncat" => need_cat = true,
             _ => {}
         }
     }
@@ -635,7 +637,7 @@ pub async fn repair(
         .map(|g| (g.app_id, g.name))
         .collect();
     let judge_only = anomalies.len() - need_ach.len() - need_detail.len();
-    if need_ach.is_empty() && need_detail.is_empty() {
+    if need_ach.is_empty() && need_detail.is_empty() && !need_cat {
         line(&format!(
             "没有可自动修复的数据异常（{} 项为判断类，请用列表中的手动标注处理）",
             judge_only
@@ -643,9 +645,10 @@ pub async fn repair(
         return Ok(());
     }
     line(&format!(
-        "待修复：成就 {} 款、商店详情 {} 款（另有判断类 {} 项需手动标注）",
+        "待修复：成就 {} 款、商店详情 {} 款、成就类型标注 {}（另有判断类 {} 项需手动标注）",
         need_ach.len(),
         need_detail.len(),
+        if need_cat { "有缺失" } else { "无" },
         judge_only
     ));
 
@@ -733,6 +736,27 @@ pub async fn repair(
                     still_failed += 1;
                     line(&format!("  [{}] {}：仍失败（{e}）", i + 1, name));
                 }
+            }
+        }
+    }
+
+    // ③ 成就类型标注补齐（重跑 LLM 类型分析；缓存命中跳过，只补缺失款）
+    if need_cat && !cancel.is_cancelled() {
+        match crate::llm::LlmClient::from_config(cfg) {
+            Ok(llm) => {
+                line("开始补齐成就类型标注（LLM，4 路并行）……");
+                let stats = crate::profiler::analyze_missing(Some(&llm), &store, &|s: &str| line(s)).await?;
+                line(&format!(
+                    "  类型标注补齐：{} 款、{} 次调用，费用 {}",
+                    stats.games,
+                    stats.calls,
+                    stats.cost_cny.map(|c| format!("¥{c:.4}")).unwrap_or_else(|| "未配置".into())
+                ));
+                fixed += stats.games as usize;
+            }
+            Err(e) => {
+                still_failed += 1;
+                line(&format!("  LLM 未配置，无法补齐成就类型标注：{e}"));
             }
         }
     }

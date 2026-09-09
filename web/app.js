@@ -671,48 +671,63 @@ async function loadLibrary() {
       </div>
     </div>
     <div class="muted" style="margin:6px 0 2px">点击游戏左上角的深度角标可手动标注（无成就游戏标「已完成」、长线游戏标「暂离」——手动标注永远优先于自动判定）</div>
+    <div style="margin:2px 0 6px"><button class="btn" id="lib-idle-mode" title="勾选多款游戏后一键确认为时长注水（挂卡/挂机）">⏱ 标注时长注水</button></div>
+    <div class="pbar hidden" id="lib-repair-bar"><div class="pfill"></div></div>
+    <div id="lib-repair-log" class="hidden"></div>
     <div class="pbar hidden" id="lib-sync-bar"><div class="pfill"></div></div>
     <div id="lib-sync-log" class="hidden"></div>`;
-    // 识别异常管理：显式列出自动识别可能有问题的游戏（数据类可自动修复，判断类快捷手动标注）
+    // 识别异常管理：显式列出自动识别可能有问题的游戏（数据类可自动修复；判断类——疑似已玩完/疑似注水——快捷手动标注，琥珀色 = 不可自动修复）
     const anomalies = lib.anomalies || [];
+    const judge = anomalies.filter((a) => a.kind === "suspect_finished" || a.kind === "idle_proposed");
+    const suspectFinished = anomalies.filter((a) => a.kind === "suspect_finished");
+    const dataKind = anomalies.length - judge.length;
     if (anomalies.length) {
-      const judge = anomalies.filter((a) => a.kind === "suspect_finished");
-      const dataKind = anomalies.length - judge.length;
       html += `<div class="panel anomaly-panel">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
           <h4 style="margin:0">⚠ 识别异常（${anomalies.length}）</h4>
           <span style="display:flex;gap:8px">
-            ${judge.length >= 2 ? `<button class="btn green" id="lib-mark-all-done" title="把下面所有「疑似已玩完」一键标为已完成（可逐个改回）">✓ 全部已玩完（${judge.length}）</button>` : ""}
+            ${suspectFinished.length >= 2 ? `<button class="btn green" id="lib-mark-all-done" title="把下面所有「疑似已玩完」一键标为已完成（可逐个改回）">✓ 全部已玩完（${suspectFinished.length}）</button>` : ""}
             <button class="btn primary" id="lib-repair" ${dataKind ? "" : "disabled title='没有可自动修复的数据异常，用列表中的手动标注处理'"}>⟳ 尝试自动修复${dataKind ? `（${dataKind} 项数据缺失）` : ""}</button>
           </span>
         </div>
-        <div class="muted" style="margin:6px 0 10px">数据缺失的重新联网拉取；疑似漏识别的用右侧按钮手动标注，标注后不再提示。</div>
-        <div id="lib-repair-log" class="hidden"></div>
+        <div class="muted" style="margin:6px 0 10px">数据缺失的重新联网拉取；<b style="color:#f0a44c">琥珀色条目不可自动修复</b>，用右侧按钮手动标注，标注后不再提示。</div>
         <div class="anomaly-list">`;
       for (const a of anomalies) {
         const quick = a.kind === "suspect_finished"
           ? `<span class="ops">
               <button class="btn green" data-app="${a.app_id}" data-act="mark-done" data-depth="已完成">已玩完</button>
-              <button class="btn" data-app="${a.app_id}" data-act="ignore-anomaly">没玩完</button>
+              <button class="btn" data-act="ignore-anomaly" data-app="${a.app_id}">没玩完</button>
              </span>`
-          : `<span class="muted">点上方「尝试自动修复」</span>`;
-        html += `<div class="anomaly-item"><div class="txt"><b>《${esc(a.name)}》</b> ${esc(a.hint)}</div>${quick}</div>`;
+          : a.kind === "idle_proposed"
+            ? `<span class="ops">
+                <button class="btn green" data-app="${a.app_id}" data-act="idle-confirm">确认注水</button>
+                <button class="btn" data-act="idle-reject">不是注水</button>
+               </span>`
+            : `<span class="muted">点上方「尝试自动修复」</span>`;
+        html += `<div class="anomaly-item${a.kind === "idle_proposed" || a.kind === "suspect_finished" ? " amber" : ""}"><div class="txt"><b>《${esc(a.name)}》</b> ${esc(a.hint)}</div>${quick}</div>`;
       }
       html += `</div></div>`;
     }
-    html += `<div class="lib-grid">`;
+    html += `<div class="lib-grid" id="lib-grid">`;
     for (const g of lib.games) {
-      const dim = g.excluded ? " dimmed" : "";
       const comp = g.completion !== null && g.completion !== undefined ? `<span>成就 ${g.completion}%</span>` : "";
+      // 注水标记（琥珀色）：提议=空心、确认=实底；只作展示，确认/否决在上方异常清单或勾选模式完成
+      const idle = g.excluded === "注水（提议）"
+        ? `<span class="idle-chip propose" title="疑似挂卡/挂机注水，总时长不可信；请到上方异常清单确认或勾选标注">⏱ 疑似注水</span>`
+        : g.excluded === "注水（已确认）"
+          ? `<span class="idle-chip confirm" title="已确认总时长注水：照常推荐，画像统计已剔除其时长">⏱ 注水已确认</span>`
+          : "";
       html += `
-      <div class="lib-item${dim}" title="${esc(g.excluded || "")}">
+      <div class="lib-item" title="${esc(g.excluded || "")}">
         <div class="lib-cover-wrap">
-          <img class="lib-cover" src="${cover(g.app_id)}" loading="lazy" onerror="this.remove()">
+          <img class="lib-cover" src="${cover(g.app_id)}" loading="lazy" decoding="async" onerror="this.remove()">
           <span class="depth-chip d-${g.depth}${g.depth_override ? " manual" : ""}" data-app="${g.app_id}" data-depth="${esc(g.depth)}" title="点击手动标注深度">${esc(g.depth)}${g.depth_override ? " ✎" : ""}</span>
+          ${idle}
+          <span class="idle-check" data-check="${g.app_id}" title="勾选为时长注水"></span>
         </div>
         <div class="lib-name">${esc(g.name)}</div>
         <div class="lib-meta">
-          <span>${g.hours} 小时</span>
+          <span${g.excluded ? ' style="text-decoration:underline dotted" title="总时长含挂卡/挂机嫌疑，仅供参考"' : ""}>${g.hours} 小时</span>
           ${comp}
           <span class="badge b-${badgeKind(g.badge)}">${esc(g.badge)}</span>
         </div>
@@ -754,30 +769,40 @@ async function loadLibrary() {
     if (repairBtn) {
       repairBtn.addEventListener("click", async () => {
         const log = $("#lib-repair-log");
-        // 进度条复用：重复修复不重复插条
-        let barBox = log.previousElementSibling;
-        if (!barBox || !barBox.classList || !barBox.classList.contains("pbar")) {
-          barBox = document.createElement("div");
-          barBox.className = "pbar";
-          barBox.innerHTML = '<div class="pfill"></div>';
-          log.before(barBox);
-        }
+        const barBox = $("#lib-repair-bar");
         const fill = barBox.querySelector(".pfill");
         fill.style.width = "0%";
-        log.classList.remove("hidden");
-        log.textContent = "开始修复…";
+        // 日志区懒显示：真有异常日志进来才展开（无可修复项时静默完成，不弹空框）
+        barBox.classList.add("hidden");
+        log.classList.add("hidden");
+        log.textContent = "";
         repairBtn.disabled = true;
+        let shown = false;
         await sseStream("/api/repair", {}, (ev) => {
+          if (!shown && (ev.type === "progress" || ev.type === "error")) {
+            shown = true;
+            barBox.classList.remove("hidden");
+            log.classList.remove("hidden");
+          }
           renderSyncProgress(ev, fill, log);
         });
         repairBtn.disabled = false;
         loadLibrary(); // 修复后异常清单/深度即时刷新
       });
     }
-    // 疑似漏识别的快捷处理：「已玩完」= 手动标已完成；「没玩完」= 忽略提示（深度保持自动判定）
+    // 疑似漏识别/疑似注水的快捷处理：已玩完=标已完成；没玩完=忽略提示；确认注水/不是注水=注水标注
     body.querySelectorAll(".anomaly-item .ops button").forEach((btn) => {
       btn.addEventListener("click", async () => {
         const app_id = Number(btn.dataset.app);
+        if (btn.dataset.act === "idle-confirm" || btn.dataset.act === "idle-reject") {
+          await api("/api/annotation", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ app_id, status: btn.dataset.act === "idle-confirm" ? "confirmed" : "rejected" }),
+          });
+          loadLibrary();
+          return;
+        }
         const body =
           btn.dataset.act === "ignore-anomaly"
             ? { app_id, kind: "anomaly_done", value: "done" }
@@ -789,6 +814,77 @@ async function loadLibrary() {
         });
         loadLibrary();
       });
+    });
+    // 时长注水批量勾选模式：进入后点击卡面勾选，底部浮条一键批量确认（不用逐卡加按钮）。
+    // 语义：进入时既有标注（提议/确认）自动勾选；批量确认时未勾选的既有项按"未注水"落库，
+    // 即主动勾选覆盖疑似警告、后续取消勾选也视作未注水不再提示
+    let idleMode = false;
+    const idleSel = new Set();
+    const idleInitial = new Set();
+    const bar = el("div", "idle-selectbar hidden");
+    document.body.appendChild(bar);
+    const renderBar = () => {
+      // 批量确认/取消会 bar.remove() 摘掉浮条——再次进入模式时要重新挂回 body
+      if (idleMode && !bar.isConnected) document.body.appendChild(bar);
+      bar.className = "idle-selectbar" + (idleMode ? "" : " hidden");
+      bar.innerHTML = idleMode
+        ? `<span>勾选时长注水的游戏（已选 ${idleSel.size} 款）</span>
+           <button class="btn green" id="idle-batch-confirm" ${idleSel.size || idleInitial.size ? "" : "disabled"}>✓ 确认标注（${idleSel.size}）</button>
+           <button class="btn" id="idle-batch-cancel">取消</button>`
+        : "";
+      bar.querySelector("#idle-batch-confirm")?.addEventListener("click", async () => {
+        try {
+          const toReject = [...idleInitial].filter((id) => !idleSel.has(id));
+          if (toReject.length) {
+            await api("/api/annotation", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ app_id: 0, status: "rejected", app_ids: toReject }),
+            });
+          }
+          if (idleSel.size) {
+            await api("/api/annotation", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ app_id: 0, status: "confirmed", app_ids: [...idleSel] }),
+            });
+          }
+        } catch (e) { /* api() 已弹错 */ }
+        idleMode = false; idleSel.clear(); idleInitial.clear(); bar.remove();
+        loadLibrary();
+      });
+      bar.querySelector("#idle-batch-cancel")?.addEventListener("click", () => {
+        idleMode = false; idleSel.clear(); idleInitial.clear(); bar.remove();
+        body.querySelectorAll(".idle-check.on").forEach((c) => c.classList.remove("on"));
+      });
+    };
+    $("#lib-idle-mode").addEventListener("click", () => {
+      idleMode = !idleMode;
+      if (idleMode) {
+        for (const g of lib.games) {
+          if (g.excluded === "注水（提议）" || g.excluded === "注水（已确认）") {
+            idleSel.add(g.app_id);
+            idleInitial.add(g.app_id);
+          }
+        }
+        renderBar();
+        body.querySelectorAll(".idle-check").forEach((c) => {
+          c.classList.toggle("show", true);
+          c.classList.toggle("on", idleSel.has(Number(c.dataset.check)));
+        });
+      } else {
+        idleSel.clear(); idleInitial.clear(); bar.remove();
+        body.querySelectorAll(".idle-check").forEach((c) => c.classList.remove("show", "on"));
+      }
+    });
+    // 委托绑在 #lib-grid 上（随 loadLibrary 重渲染一起重建，避免 body 监听跨渲染累积）
+    $("#lib-grid").addEventListener("click", (e) => {
+      const check = e.target.closest(".idle-check");
+      if (!check || !idleMode) return;
+      const id = Number(check.dataset.check);
+      if (idleSel.has(id)) { idleSel.delete(id); check.classList.remove("on"); }
+      else { idleSel.add(id); check.classList.add("on"); }
+      renderBar();
     });
     bindDepthMenu(body, lib.depth_options || []);
   } catch (e) {

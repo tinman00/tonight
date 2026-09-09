@@ -205,6 +205,8 @@ pub fn build_facts(
             depth: c.depth,
             badge: c.badge,
             tags: c.genres.clone(),
+            // 注水游戏的天数/积压照常（挂卡注水的是总时长，不是游玩时间点——
+            // "N 天没玩"与积压分依然真实）；总时长从不进事实包，卡片天然无痕
             days_since_played: c.last_played.map(|t| (now.saturating_sub(t)) / 86_400),
             motivation: c.breakdown.motivation,
             tag_score: c.breakdown.tag,
@@ -245,7 +247,7 @@ fn card_points(g: &GameFacts) -> Vec<CardPoint> {
             Some(d) => format!("{d} 天没玩"),
         },
     });
-    // 未开封游戏没有"你的成就进度"语境，成就中位数是噪音，不生成该推荐点
+    // 未开封游戏没有"你的成就进度"语境，成就中位数是统计噪音，不生成该推荐点
     if let (Some(m), Some(_)) = (g.global_median_pct, g.days_since_played) {
         out.push(CardPoint { kind: "attain".into(), text: format!("成就中位 {m:.0}%") });
     }
@@ -309,7 +311,8 @@ fn card_user_prompt(digest: &str, intent_desc: &str, facts: &[GameFacts]) -> Str
     format!("玩家画像：{digest}\n用户当前需求：{intent_desc}\n候选事实：\n{f}")
 }
 
-/// 候选事实行（主批与探索位专项 prompt 共用，避免口径漂移）
+/// 候选事实行（主批与探索位专项 prompt 共用，避免口径漂移）。
+/// 不含总游玩时长（注水游戏照常推荐且卡片无时长痕迹）；天数是真实行为信号，保留。
 fn fact_line(g: &GameFacts) -> String {
     let days = match g.days_since_played {
         Some(d) => format!("距上次游玩 {d} 天"),
@@ -325,19 +328,22 @@ fn fact_line(g: &GameFacts) -> String {
     } else {
         ""
     };
-    format!(
-        "- app_id {} 《{}》｜{}｜{}｜标签：{}｜{}｜动机匹配 {:.0}%｜{}{}{}\n",
-        g.app_id,
-        g.name,
-        g.depth,
-        g.badge,
-        g.tags.join("、"),
+    // 分段拼接（天数字段恒在，保持与旧口径一致的行格式）
+    let mut parts = vec![
+        format!("app_id {}", g.app_id),
+        format!("《{}》", g.name),
+        g.depth.to_string(),
+        g.badge.to_string(),
+        format!("标签：{}", g.tags.join("、")),
         days,
-        g.motivation * 100.0,
+        format!("动机匹配 {:.0}%", g.motivation * 100.0),
         median,
-        if g.cat_dist.is_empty() { String::new() } else { format!("｜成就类型：{}", g.cat_dist) },
-        explore_mark
-    )
+    ];
+    if !g.cat_dist.is_empty() {
+        parts.push(format!("成就类型：{}", g.cat_dist));
+    }
+    let line = parts.join("｜");
+    format!("- {line}{}{}\n", if explore_mark.is_empty() { "" } else { "｜" }, explore_mark)
 }
 
 /// 卡片草稿（LLM 输出的镜像；推荐点标签由 Rust 计算，不要求 LLM 输出）

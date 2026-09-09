@@ -605,6 +605,23 @@ pub fn detect_anomalies(store: &Store, cfg: &Config) -> Result<Vec<(u32, String,
             .last_played
             .map(|t| (now.saturating_sub(t)) / 86_400)
             .unwrap_or(u64::MAX);
+        // 成就类型标注缺失：成就已拉到但 LLM 类型分析没覆盖（分析中断/失败遗留）——
+        // 深度判定与成就维评分缺信号。0 成就游戏（无成就系统）不在此列。
+        if g.total_achievements > 0 {
+            let cats = store.categorized_count(g.app_id).unwrap_or(0);
+            let ach = store.achievement_count(g.app_id).unwrap_or(0);
+            if ach > cats {
+                out.push((
+                    g.app_id,
+                    g.name.clone(),
+                    "ach_uncat".into(),
+                    format!(
+                        "成就已拉取但类型标注不全（{cats}/{ach}）——深度判定与成就维评分缺信号，可尝试自动修复"
+                    ),
+                ));
+                continue;
+            }
+        }
         // 弃坑/暂离两档都提示（v0.46）：长线/叙事类的"暂离"里藏着通关但成就信号不足的漏网形态
         if matches!(g.depth, GameDepth::Abandoned | GameDepth::Service)
             && g.playtime_min >= 360
@@ -620,6 +637,23 @@ pub fn detect_anomalies(store: &Store, cfg: &Config) -> Result<Vec<(u32, String,
                     days_since
                 ),
             ));
+        }
+    }
+    // 时长注水嫌疑（机器提议、待确认）：判断类异常，不可自动修复——
+    // 注水游戏已照常进推荐（卡片无总时长内容），这里请用户确认/否决；否决后不再提示
+    for (id, kind, status, note) in store.annotations()? {
+        if kind == "idle_mark" && status == "proposed" {
+            if let Some(g) = profile.games.iter().find(|g| g.app_id == id) {
+                out.push((
+                    id,
+                    g.name.clone(),
+                    "idle_proposed".into(),
+                    format!(
+                        "疑似挂卡/挂机注水（{}）——总时长不可信，请确认",
+                        note.unwrap_or_else(|| "证据见画像页".into())
+                    ),
+                ));
+            }
         }
     }
     Ok(out)
@@ -1256,12 +1290,15 @@ mod tests {
             }])
             .unwrap();
         store.upsert_app_detail(3, &detail_of("game")).unwrap();
-        // 有成就但完成度 0（未通关证据），避免落入 no_ach
+        // 有成就但完成度 0（未通关证据），避免落入 no_ach；类型标注补全，避免落入 ach_uncat
         store
             .upsert_achievements(
                 3,
                 &[crate::models::Achievement { api_name: "A".into(), achieved: false, unlock_time: None }],
             )
+            .unwrap();
+        store
+            .upsert_achievement_categories(3, &[("A".into(), AchievementCategory::Other)])
             .unwrap();
         // 正常游戏：不产生异常
         store.upsert_owned_games(&[owned(4, 60)]).unwrap();
@@ -1272,6 +1309,9 @@ mod tests {
                 &[crate::models::Achievement { api_name: "A".into(), achieved: false, unlock_time: None }],
             )
             .unwrap();
+        store
+            .upsert_achievement_categories(4, &[("A".into(), AchievementCategory::Other)])
+            .unwrap();
 
         let anomalies = detect_anomalies(&store, &Config::default()).unwrap();
         let kinds: Vec<(u32, &str)> = anomalies.iter().map(|(id, _, k, _)| (*id, k.as_str())).collect();
@@ -1279,6 +1319,30 @@ mod tests {
         assert!(kinds.contains(&(2, "no_ach")), "{kinds:?}");
         assert!(kinds.contains(&(3, "suspect_finished")), "{kinds:?}");
         assert!(!kinds.iter().any(|(id, _)| *id == 4), "{kinds:?}");
+
+        // ach_uncat：成就已拉取但类型标注缺失（0 成就游戏不触发）
+        store.upsert_owned_games(&[owned(5, 120)]).unwrap();
+        store.upsert_app_detail(5, &detail_of("game")).unwrap();
+        store
+            .upsert_achievements(
+                5,
+                &[
+                    crate::models::Achievement { api_name: "X".into(), achieved: false, unlock_time: None },
+                    crate::models::Achievement { api_name: "Y".into(), achieved: false, unlock_time: None },
+                ],
+            )
+            .unwrap();
+        let anomalies = detect_anomalies(&store, &Config::default()).unwrap();
+        assert!(anomalies.iter().any(|(id, _, k, _)| *id == 5 && k == "ach_uncat"));
+        // 补齐标注后不再提示
+        store
+            .upsert_achievement_categories(
+                5,
+                &[("X".into(), AchievementCategory::Other), ("Y".into(), AchievementCategory::Other)],
+            )
+            .unwrap();
+        let anomalies = detect_anomalies(&store, &Config::default()).unwrap();
+        assert!(!anomalies.iter().any(|(id, ..)| *id == 5), "{anomalies:?}");
 
         // 手动标注后视为已处理，不再提示（suspect_finished → 标已完成）
         store.set_override(3, "depth", "已完成").unwrap();
@@ -1311,12 +1375,15 @@ mod tests {
             .unwrap();
         store.upsert_app_detail(730, &detail_of("game")).unwrap();
         store.upsert_store_tags(730, &tags(&["免费开玩", "多人", "竞技", "射击"])).unwrap();
-        // 有成就但完成度 0（未通关证据），避免落入 no_ach
+        // 有成就但完成度 0（未通关证据），避免落入 no_ach；类型标注补全，避免落入 ach_uncat
         store
             .upsert_achievements(
                 730,
                 &[crate::models::Achievement { api_name: "A".into(), achieved: false, unlock_time: None }],
             )
+            .unwrap();
+        store
+            .upsert_achievement_categories(730, &[("A".into(), AchievementCategory::Other)])
             .unwrap();
         let p = compute(&store, &Config::default()).unwrap();
         let g = p.games.iter().find(|g| g.app_id == 730).unwrap();

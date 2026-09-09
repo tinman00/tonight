@@ -559,6 +559,23 @@ impl Store {
         Ok(())
     }
 
+    /// 手动标注注水（库存页入口）：confirmed=确认注水 / rejected=未注水。
+    /// 与 set_annotation_status 的区别：机器从未提议过的游戏也能直接标（upsert，note 记来源）。
+    pub fn set_idle_mark(&self, app_id: u32, status: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO annotations (app_id, kind, status, note, updated_at)
+             VALUES (?1, 'idle_mark', ?2, '手动标注', ?3)
+             ON CONFLICT(app_id) DO UPDATE SET
+               status = excluded.status,
+               note = CASE WHEN annotations.note IS NULL OR annotations.note = ''
+                           THEN '手动标注' ELSE annotations.note END,
+               updated_at = excluded.updated_at",
+            params![app_id, status, now()],
+        )?;
+        Ok(())
+    }
+
     /// 写入口味排除标注（按标签内容去重，修正层）。
     pub fn propose_taste_exclude(&self, tag: &str) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
